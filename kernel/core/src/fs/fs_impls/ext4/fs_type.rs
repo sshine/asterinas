@@ -38,9 +38,11 @@ impl FsType for Ext4Type {
     }
 
     fn create(&self, fs_creation_ctx: &mut FsCreationCtx) -> Result<Arc<dyn FileSystem>> {
-        fs_creation_ctx.resolve_block_device()?;
+        let disk = fs_creation_ctx.resolve_block_device()?.clone();
+        let flags = fs_creation_ctx.flags();
+        let args = fs_creation_ctx.args();
 
-        return_errno_with_message!(Errno::ENOSYS, "ext4 mounting is not implemented yet")
+        super::fs::open(disk, flags, args)
     }
 
     fn obtain_key_and_cache(

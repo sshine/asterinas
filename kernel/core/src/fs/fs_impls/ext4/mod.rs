@@ -29,7 +29,14 @@
 pub(in crate::fs) use self::fs_type::EXT4_TYPE;
 use crate::fs::vfs::registry;
 
+mod features;
+mod fs;
 mod fs_type;
+mod prelude;
+mod super_block;
+
+#[cfg(ktest)]
+mod test_utils;
 
 /// Registers the ext4 filesystem type with the VFS registry.
 pub(super) fn init() {
@@ -50,7 +57,6 @@ fn init_for_ktest() {
     INIT.call_once(|| {
         aster_systree::init_for_ktest();
         crate::fs::vfs::init();
-        super::sysfs::init();
         init();
     });
 }
