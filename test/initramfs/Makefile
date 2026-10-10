@@ -30,6 +30,7 @@ INITRAMFS_IMAGE := $(BUILD_DIR)/initramfs.cpio.gz
 INITRAMFS_COMPRESSED := true
 endif
 EXT2_IMAGE := $(BUILD_DIR)/ext2.img
+EXT4_IMAGE := $(BUILD_DIR)/ext4.img
 EXFAT_IMAGE := $(BUILD_DIR)/exfat.img
 LTP_DEV_IMAGE := $(BUILD_DIR)/ltp_dev.img
 SSD_IMAGE := $(BUILD_DIR)/nvme0n1.img
@@ -78,9 +79,9 @@ endif
 ifeq ($(TARGET_ARCH), loongarch64)
 data-disk-images: $(EXT2_IMAGE) $(EXFAT_IMAGE)
 else ifeq ($(XFSTESTS_NEEDS_BLOCK_DEVICES), true)
-data-disk-images: $(EXT2_IMAGE) $(EXFAT_IMAGE) $(LTP_DEV_IMAGE) $(SSD_IMAGE) $(XFSTESTS_TEST_IMAGE) $(XFSTESTS_SCRATCH_IMAGE)
+data-disk-images: $(EXT2_IMAGE) $(EXT4_IMAGE) $(EXFAT_IMAGE) $(LTP_DEV_IMAGE) $(SSD_IMAGE) $(XFSTESTS_TEST_IMAGE) $(XFSTESTS_SCRATCH_IMAGE)
 else
-data-disk-images: $(EXT2_IMAGE) $(EXFAT_IMAGE) $(LTP_DEV_IMAGE) $(SSD_IMAGE)
+data-disk-images: $(EXT2_IMAGE) $(EXT4_IMAGE) $(EXFAT_IMAGE) $(LTP_DEV_IMAGE) $(SSD_IMAGE)
 endif
 
 .PHONY: $(INITRAMFS_IMAGE)
@@ -203,6 +204,12 @@ $(EXT2_IMAGE):
 	@mkdir -p $(BUILD_DIR)
 	@dd if=/dev/zero of=$(EXT2_IMAGE) bs=2G count=1
 	@mke2fs $(EXT2_IMAGE)
+
+# The image is read by the ext4 regression tests, which expect the tree that
+# the script below writes into it.
+$(EXT4_IMAGE):
+	@mkdir -p $(BUILD_DIR)
+	@../../tools/make_ext4_image.sh $(EXT4_IMAGE) 64M
 
 $(EXFAT_IMAGE):
 	@mkdir -p $(BUILD_DIR)

@@ -105,6 +105,11 @@ test_ext2 "/ext2" "test_file.txt"
 ./ext2/xattr
 echo "All ext2 fs test passed."
 
+echo "Start ext4 fs test......"
+./ext4/read
+./ext4/readdir
+echo "All ext4 fs test passed."
+
 echo "Start fdatasync test......"
 test_fdatasync
 echo "All fdatasync test passed."

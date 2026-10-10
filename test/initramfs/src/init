@@ -46,6 +46,12 @@ if [ -b /dev/vdb ]; then
     mount -t exfat /dev/vdb /exfat
 fi
 
+# The ext4 driver mounts read-only, so the tests that read this image expect it
+# to stay as `tools/make_ext4_image.sh` left it.
+if [ -b /dev/vdd ]; then
+    mount -t ext4 -o ro /dev/vdd /ext4
+fi
+
 # When the init process starts,
 # it does not have a process group, session, or controlling terminal.
 # The `script` tool is a standard Linux utility
