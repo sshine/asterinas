@@ -3,7 +3,7 @@
 //! Re-exports used throughout the ext2 module.
 
 pub(super) use core::{
-    ops::{Deref, DerefMut, Range},
+    ops::Range,
     time::Duration,
 };
 
@@ -21,12 +21,12 @@ pub(super) use ostd::{
 
 pub(super) use super::{
     inode::{Ext2Bid, Ext2Ino, Iblock},
-    utils::{Dirty, IsPowerOf},
+    utils::IsPowerOf,
 };
 pub(super) use crate::{
     fs::{
         file::InodeType,
-        utils::{DirentVisitor, Str16, Str64},
+        utils::{DirentVisitor, Dirty, Str16, Str64},
     },
     prelude::*,
     time::UnixTime,

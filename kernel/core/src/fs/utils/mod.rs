@@ -4,11 +4,13 @@
 
 pub(crate) use dirent_visitor::DirentVisitor;
 pub(crate) use direntry_vec::DirEntryVecExt;
+pub(crate) use dirty::Dirty;
 pub(crate) use endpoint::{Endpoint, EndpointState};
 pub(crate) use id_bitmap::IdBitmap;
 
 mod dirent_visitor;
 mod direntry_vec;
+mod dirty;
 mod endpoint;
 mod id_bitmap;
 pub(crate) mod systree_inode;
