@@ -70,7 +70,7 @@ impl Ext4MemoryDisk {
         let segment = FrameAllocOptions::new()
             .zeroed(true)
             .alloc_segment(npages)
-            .unwrap();
+            .expect("the fixture device should fit in memory");
 
         Self {
             segment,
@@ -83,12 +83,14 @@ impl Ext4MemoryDisk {
     pub(super) fn write_block(&self, bid: u64, data: &[u8]) {
         self.segment
             .write_bytes(bid as usize * BLOCK_SIZE, data)
-            .unwrap();
+            .expect("the block should lie within the device");
     }
 
     fn from_image(image: &[u8]) -> Self {
         let disk = Self::new(image.len().div_ceil(BLOCK_SIZE));
-        disk.segment.write_bytes(0, image).unwrap();
+        disk.segment
+            .write_bytes(0, image)
+            .expect("the device was sized to hold the image");
         disk
     }
 }
@@ -115,13 +117,14 @@ impl BlockDevice for Ext4MemoryDisk {
                 BioType::Read => seg
                     .dma_slice()
                     .writer()
-                    .unwrap()
+                    .expect("a read segment is writable")
                     .write(self.segment.reader().skip(cur_device_ofs)),
-                BioType::Write => self
-                    .segment
-                    .writer()
-                    .skip(cur_device_ofs)
-                    .write(&mut seg.dma_slice().reader().unwrap()),
+                BioType::Write => self.segment.writer().skip(cur_device_ofs).write(
+                    &mut seg
+                        .dma_slice()
+                        .reader()
+                        .expect("a write segment is readable"),
+                ),
                 _ => {
                     bio.complete(BioStatus::NotSupported);
                     return Ok(());

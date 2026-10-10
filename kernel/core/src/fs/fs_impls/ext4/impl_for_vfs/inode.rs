@@ -174,7 +174,8 @@ impl Inode for Ext4Inode {
 
     fn fs(&self) -> Arc<dyn FileSystem> {
         // The inode must belong to a live filesystem instance.
-        self.fs().unwrap()
+        self.fs()
+            .expect("a mounted filesystem outlives the inodes read from it")
     }
 
     fn extension(&self) -> &Extension {

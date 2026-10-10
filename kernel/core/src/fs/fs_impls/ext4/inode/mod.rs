@@ -561,8 +561,11 @@ impl InodePayload {
 
 /// Decodes the device number a special file stores in its `i_block` area.
 fn decode_device_id(block: &[u8; EXTENT_ROOT_LEN]) -> u64 {
-    let first = u32::from_le_bytes(block[0..4].try_into().unwrap());
-    let second = u32::from_le_bytes(block[4..8].try_into().unwrap());
+    // Destructuring a fixed-size array keeps the decode free of a fallible
+    // conversion that could never actually fail.
+    let [b0, b1, b2, b3, b4, b5, b6, b7, ..] = *block;
+    let first = u32::from_le_bytes([b0, b1, b2, b3]);
+    let second = u32::from_le_bytes([b4, b5, b6, b7]);
 
     let (major, minor) = if first != 0 {
         // The historical encoding: eight bits of each.

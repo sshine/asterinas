@@ -79,7 +79,7 @@ pub(in crate::fs) mod test_utils;
 
 /// Registers the ext4 filesystem type with the VFS registry.
 pub(super) fn init() {
-    registry::register(&EXT4_TYPE).unwrap();
+    registry::register(&EXT4_TYPE).expect("the ext4 FS type is registered exactly once");
 }
 
 /// Brings up the subsystems that ext4 registration depends on.

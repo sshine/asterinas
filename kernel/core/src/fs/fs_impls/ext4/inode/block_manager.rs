@@ -112,7 +112,9 @@ impl BlockAsPageCacheBackend for InodeBlockManager {
                 }
                 IoRange::Unwritten(range) | IoRange::Hole(range) => {
                     for locked_page in pages.by_ref().take(range.len()) {
-                        locked_page.fill_zeros(0, PAGE_SIZE).unwrap();
+                        locked_page
+                            .fill_zeros(0, PAGE_SIZE)
+                            .expect("a cache page is exactly one page long");
                         locked_page.set_up_to_date();
                     }
                 }
