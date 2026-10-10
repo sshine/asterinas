@@ -878,6 +878,158 @@ mod test {
         assert_eq!(device_id, DeviceId::new(MajorId::new(1), MinorId::new(3)));
     }
 
+    /// Reads that start and end inside a block are where an implementation
+    /// that works in whole blocks quietly returns the wrong bytes.
+    #[ktest]
+    fn a_read_inside_one_block_returns_only_what_was_asked_for() {
+        let ext4 = mount();
+        let inode = ext4.read_inode(HELLO_INO).expect("should read");
+
+        let mut buf = [0u8; 5];
+        let mut writer = VmWriter::from(buf.as_mut_slice()).to_fallible();
+        let read = inode.read_at(7, &mut writer).expect("should read");
+
+        assert_eq!(read, 5);
+        assert_eq!(&buf, &HELLO_CONTENT[7..12]);
+    }
+
+    /// A read that spans two logical blocks must join them in order.
+    #[ktest]
+    fn a_read_across_a_block_boundary_joins_both_blocks() {
+        let ext4 = mount();
+        let inode = ext4.read_inode(TWO_EXTENT_INO).expect("should read");
+
+        let mut buf = [0u8; 4];
+        let mut writer = VmWriter::from(buf.as_mut_slice()).to_fallible();
+        let read = inode
+            .read_at(BLOCK_SIZE - 2, &mut writer)
+            .expect("should read");
+
+        assert_eq!(read, 4);
+        assert_eq!(
+            buf,
+            [
+                TWO_EXTENT_FILL[0],
+                TWO_EXTENT_FILL[0],
+                TWO_EXTENT_FILL[1],
+                TWO_EXTENT_FILL[1]
+            ]
+        );
+    }
+
+    /// A read that runs past the end stops there, rather than returning the
+    /// slack that the last block still holds.
+    #[ktest]
+    fn a_read_is_clipped_to_the_end_of_the_file() {
+        let ext4 = mount();
+        let inode = ext4.read_inode(HELLO_INO).expect("should read");
+
+        let mut buf = [0xffu8; 64];
+        let mut writer = VmWriter::from(buf.as_mut_slice()).to_fallible();
+        let read = inode.read_at(0, &mut writer).expect("should read");
+
+        assert_eq!(read, HELLO_CONTENT.len());
+        assert_eq!(&buf[..read], HELLO_CONTENT);
+        assert_eq!(buf[read], 0xff, "nothing past the end should be touched");
+    }
+
+    #[ktest]
+    fn a_read_starting_past_the_end_returns_nothing() {
+        let ext4 = mount();
+        let inode = ext4.read_inode(HELLO_INO).expect("should read");
+
+        let mut buf = [0u8; 8];
+        let mut writer = VmWriter::from(buf.as_mut_slice()).to_fallible();
+
+        assert_eq!(
+            inode
+                .read_at(HELLO_CONTENT.len(), &mut writer)
+                .expect("should read"),
+            0
+        );
+    }
+
+    #[ktest]
+    fn a_read_of_no_bytes_returns_nothing() {
+        let ext4 = mount();
+        let inode = ext4.read_inode(HELLO_INO).expect("should read");
+
+        let mut buf: [u8; 0] = [];
+        let mut writer = VmWriter::from(buf.as_mut_slice()).to_fallible();
+
+        assert_eq!(inode.read_at(0, &mut writer).expect("should read"), 0);
+    }
+
+    /// Reading from inside the hole of a sparse file yields zeros without
+    /// consulting the device.
+    #[ktest]
+    fn a_read_that_starts_inside_a_hole_yields_zeros() {
+        let ext4 = mount();
+        let inode = ext4.read_inode(SPARSE_INO).expect("should read");
+
+        let mut buf = [0xffu8; 16];
+        let mut writer = VmWriter::from(buf.as_mut_slice()).to_fallible();
+        let read = inode
+            .read_at(2 * BLOCK_SIZE, &mut writer)
+            .expect("should read");
+
+        assert_eq!(read, buf.len());
+        assert!(buf.iter().all(|&byte| byte == 0));
+    }
+
+    /// A direct read works in whole blocks, so an unaligned one is refused
+    /// rather than quietly served from the wrong offset.
+    #[ktest]
+    fn an_unaligned_direct_read_is_refused() {
+        let ext4 = mount();
+        let inode = ext4.read_inode(TWO_EXTENT_INO).expect("should read");
+
+        let mut buf = [0u8; BLOCK_SIZE];
+        let mut writer = VmWriter::from(buf.as_mut_slice()).to_fallible();
+
+        assert_errno(inode.read_direct_at(1, &mut writer), Errno::EINVAL);
+    }
+
+    /// A 128-byte inode stops before the fields ext4 added, so it carries no
+    /// creation time and no nanoseconds.
+    #[ktest]
+    fn a_classic_sized_inode_has_no_creation_time() {
+        let volume = Ext4VolumeBuilder::new().inode_size(128).build();
+        let fs = fs::open(volume.disk.clone(), FsFlags::empty(), None).expect("should mount");
+        let ext4 = fs
+            .downcast_ref::<Ext4>()
+            .expect("should be an ext4 volume")
+            .root_inode()
+            .expect("root should be readable")
+            .fs()
+            .expect("the filesystem should outlive its root");
+
+        let inode = ext4.read_inode(HELLO_INO).expect("should read");
+
+        assert_eq!(inode.metadata().birth_at, None);
+        assert_eq!(read_whole(&inode), HELLO_CONTENT);
+    }
+
+    /// The whole-second part of a timestamp survives a volume whose inodes are
+    /// too small to hold the nanosecond half.
+    #[ktest]
+    fn a_classic_sized_inode_keeps_its_whole_second_timestamps() {
+        let volume = Ext4VolumeBuilder::new().inode_size(128).build();
+        let fs = fs::open(volume.disk.clone(), FsFlags::empty(), None).expect("should mount");
+        let ext4 = fs
+            .downcast_ref::<Ext4>()
+            .expect("should be an ext4 volume")
+            .root_inode()
+            .expect("root should be readable")
+            .fs()
+            .expect("the filesystem should outlive its root");
+
+        let metadata = ext4.read_inode(HELLO_INO).expect("should read").metadata();
+
+        assert_eq!(metadata.last_access_at.subsec_nanos(), 0);
+        assert!(metadata.last_access_at.as_secs() > 0);
+    }
+
     /// `i_crtime` lives past the classic 128-byte inode, so a volume with
     /// large inodes reports a creation time where ext2 reports none.
     #[ktest]

@@ -50,23 +50,35 @@ pub(super) fn assert_errno<T: Debug>(result: Result<T>, expected: Errno) {
 }
 
 /// A block device backed by memory, for tests that need no image on disk.
+///
+/// The device may report more blocks than it materialises. Everything past the
+/// materialised prefix reads as zeros and discards writes, which is what lets
+/// a fixture describe a volume with the geometry `mkfs.ext4` really uses
+/// without allocating the gigabyte such a volume would occupy.
 pub(super) struct Ext4MemoryDisk {
     segment: Segment<()>,
+    /// Blocks the device reports, at least as many as `segment` holds.
+    nr_blocks: usize,
     minor: u32,
 }
 
 impl Ext4MemoryDisk {
-    /// Creates a zeroed device of `nblocks` blocks.
+    /// Creates a zeroed device of `nblocks` blocks, all materialised.
     ///
     /// Each device gets a distinct ID because `Ext4Type` keys its instance
     /// cache on it, and two devices sharing one ID would be served the same
     /// filesystem across unrelated tests.
     pub(super) fn new(nblocks: usize) -> Self {
+        Self::with_reported_size(nblocks, nblocks)
+    }
+
+    fn with_reported_size(materialised_blocks: usize, nr_blocks: usize) -> Self {
         use core::sync::atomic::{AtomicU32, Ordering};
 
         static NEXT_MINOR: AtomicU32 = AtomicU32::new(0);
 
-        let npages = (nblocks * BLOCK_SIZE).div_ceil(PAGE_SIZE);
+        debug_assert!(materialised_blocks <= nr_blocks);
+        let npages = (materialised_blocks * BLOCK_SIZE).div_ceil(PAGE_SIZE);
         let segment = FrameAllocOptions::new()
             .zeroed(true)
             .alloc_segment(npages)
@@ -74,6 +86,7 @@ impl Ext4MemoryDisk {
 
         Self {
             segment,
+            nr_blocks,
             minor: NEXT_MINOR.fetch_add(1, Ordering::Relaxed),
         }
     }
@@ -86,8 +99,9 @@ impl Ext4MemoryDisk {
             .expect("the block should lie within the device");
     }
 
-    fn from_image(image: &[u8]) -> Self {
-        let disk = Self::new(image.len().div_ceil(BLOCK_SIZE));
+    /// Creates a device of `nr_blocks` blocks whose leading bytes are `image`.
+    fn from_image(image: &[u8], nr_blocks: usize) -> Self {
+        let disk = Self::with_reported_size(image.len().div_ceil(BLOCK_SIZE), nr_blocks);
         disk.segment
             .write_bytes(0, image)
             .expect("the device was sized to hold the image");
@@ -113,18 +127,39 @@ impl BlockDevice for Ext4MemoryDisk {
         let mut cur_device_ofs = bio.sid_range().start.to_raw() as usize * SECTOR_SIZE;
 
         for seg in bio.segments() {
+            let materialised = self.segment.size().saturating_sub(cur_device_ofs);
             let io_size = match bio.type_() {
-                BioType::Read => seg
-                    .dma_slice()
-                    .writer()
-                    .expect("a read segment is writable")
-                    .write(self.segment.reader().skip(cur_device_ofs)),
-                BioType::Write => self.segment.writer().skip(cur_device_ofs).write(
-                    &mut seg
+                BioType::Read => {
+                    let mut writer = seg
+                        .dma_slice()
+                        .writer()
+                        .expect("a read segment is writable");
+                    let from_image = if materialised > 0 {
+                        writer.write(self.segment.reader().skip(cur_device_ofs))
+                    } else {
+                        0
+                    };
+                    // Blocks the fixture never materialised read as zeros, as
+                    // the untouched parts of a sparse image on disk would.
+                    let remaining = writer.avail();
+                    from_image + writer.fill_zeros(remaining)
+                }
+                BioType::Write => {
+                    let mut reader = seg
                         .dma_slice()
                         .reader()
-                        .expect("a write segment is readable"),
-                ),
+                        .expect("a write segment is readable");
+                    if materialised > 0 {
+                        self.segment
+                            .writer()
+                            .skip(cur_device_ofs)
+                            .write(&mut reader)
+                    } else {
+                        // A write past the materialised prefix is dropped, so
+                        // a test that needs one must size the fixture for it.
+                        reader.remain()
+                    }
+                }
                 _ => {
                     bio.complete(BioStatus::NotSupported);
                     return Ok(());
@@ -140,7 +175,7 @@ impl BlockDevice for Ext4MemoryDisk {
     fn metadata(&self) -> BlockDeviceMeta {
         BlockDeviceMeta {
             max_nr_segments_per_bio: usize::MAX,
-            nr_sectors: self.segment.size() / SECTOR_SIZE,
+            nr_sectors: self.nr_blocks * (BLOCK_SIZE / SECTOR_SIZE),
         }
     }
 
@@ -189,10 +224,17 @@ const STOCK_COMPAT: u32 = 0x103c;
 const STOCK_INCOMPAT: u32 = 0x22c2;
 const STOCK_RO_COMPAT: u32 = 0x46b;
 
+/// Counts the fixture superblock declares, so that `statfs` has something
+/// other than zero to report.
+pub(super) const FREE_BLOCKS: u32 = 100;
+pub(super) const RESERVED_BLOCKS: u32 = 12;
+pub(super) const FREE_INODES: u32 = 40;
+
 const NR_GROUPS: usize = 2;
 const BLOCKS_PER_GROUP: u32 = 128;
 const INODES_PER_GROUP: u32 = 32;
-const TOTAL_BLOCKS: u32 = BLOCKS_PER_GROUP * NR_GROUPS as u32;
+pub(super) const TOTAL_BLOCKS: u32 = BLOCKS_PER_GROUP * NR_GROUPS as u32;
+pub(super) const TOTAL_INODES: u32 = INODES_PER_GROUP * NR_GROUPS as u32;
 
 /// Inode numbers of the files every built volume contains.
 pub(super) const HELLO_INO: Ext4Ino = 11;
@@ -202,6 +244,12 @@ pub(super) const TWO_EXTENT_INO: Ext4Ino = 14;
 pub(super) const DEEP_INO: Ext4Ino = 15;
 pub(super) const BAD_EXTENT_INO: Ext4Ino = 16;
 pub(super) const DEVICE_INO: Ext4Ino = 17;
+pub(super) const FIFO_INO: Ext4Ino = 18;
+pub(super) const SLOW_SYMLINK_INO: Ext4Ino = 19;
+pub(super) const DELETED_INO: Ext4Ino = 20;
+pub(super) const INLINE_DATA_INO: Ext4Ino = 21;
+pub(super) const BLOCK_MAPPED_INO: Ext4Ino = 22;
+pub(super) const WIDE_DIR_INO: Ext4Ino = 23;
 pub(super) const SECOND_GROUP_INO: Ext4Ino = INODES_PER_GROUP + 1;
 
 pub(super) const HELLO_CONTENT: &[u8] = b"hello, ext4\n";
@@ -215,9 +263,19 @@ pub(super) const SPARSE_FILL: u8 = 0x51;
 pub(super) const SPARSE_TAIL_IBLOCK: usize = 4;
 pub(super) const SPARSE_BLOCKS: usize = 5;
 
+/// A symlink target too long to live inside the inode, so that it needs a data
+/// block and the slow path that reads one.
+pub(super) const SLOW_SYMLINK_TARGET: &str =
+    "a-target-too-long-to-fit-in-the-sixty-bytes-an-inode-can-hold";
+
+/// Names in the two-block directory, which is what makes a reader cross from
+/// one directory block into the next.
+pub(super) const WIDE_DIR_FIRST_BLOCK: [&str; 3] = [".", "..", "first-block-entry"];
+pub(super) const WIDE_DIR_SECOND_BLOCK: [&str; 2] = ["second-block-entry", "last"];
+
 /// The entries the root directory of a built volume holds, in order, each with
 /// the `file_type` byte that names its kind.
-pub(super) const ROOT_ENTRIES: [(&str, Ext4Ino, u8); 10] = [
+pub(super) const ROOT_ENTRIES: [(&str, Ext4Ino, u8); 16] = [
     (".", 2, 2),
     ("..", 2, 2),
     ("hello", HELLO_INO, 1),
@@ -227,6 +285,12 @@ pub(super) const ROOT_ENTRIES: [(&str, Ext4Ino, u8); 10] = [
     ("deep", DEEP_INO, 1),
     ("bad", BAD_EXTENT_INO, 1),
     ("null", DEVICE_INO, 3),
+    ("fifo", FIFO_INO, 5),
+    ("slow-link", SLOW_SYMLINK_INO, 7),
+    ("deleted", DELETED_INO, 1),
+    ("inline", INLINE_DATA_INO, 1),
+    ("block-mapped", BLOCK_MAPPED_INO, 1),
+    ("wide", WIDE_DIR_INO, 2),
     ("second", SECOND_GROUP_INO, 1),
 ];
 
@@ -268,6 +332,13 @@ impl Ext4VolumeBuilder {
         self
     }
 
+    /// Uses the 128-byte inode of the classic layout, which holds none of the
+    /// fields ext4 added after it.
+    pub(super) fn inode_size(mut self, inode_size: usize) -> Self {
+        self.inode_size = inode_size;
+        self
+    }
+
     /// Declares the features `mkfs.ext4` sets when given no options.
     pub(super) fn stock_features(mut self) -> Self {
         self.stock_features = true;
@@ -297,7 +368,10 @@ impl Ext4VolumeBuilder {
 
         let raw_super_block = image.read_val::<RawSuperBlock>(SUPER_BLOCK_OFFSET);
         Ext4Volume {
-            disk: Arc::new(Ext4MemoryDisk::from_image(&image.bytes)) as Arc<dyn BlockDevice>,
+            disk: Arc::new(Ext4MemoryDisk::from_image(
+                &image.bytes,
+                TOTAL_BLOCKS as usize,
+            )) as Arc<dyn BlockDevice>,
             super_block: SuperBlock::try_from(raw_super_block)
                 .expect("the built superblock should be valid"),
             inode_table_bids,
@@ -311,6 +385,9 @@ impl Ext4VolumeBuilder {
         raw.inodes_per_group = INODES_PER_GROUP;
         raw.inodes_count = INODES_PER_GROUP * NR_GROUPS as u32;
         raw.blocks_count_lo = TOTAL_BLOCKS;
+        raw.free_blocks_count_lo = FREE_BLOCKS;
+        raw.reserved_blocks_count_lo = RESERVED_BLOCKS;
+        raw.free_inodes_count = FREE_INODES;
         raw.inode_size = self.inode_size as u16;
         raw.desc_size = self.desc_size as u16;
         if self.stock_features {
@@ -371,7 +448,10 @@ impl Ext4VolumeBuilder {
         let index_in_group = ((ino - 1) % INODES_PER_GROUP) as usize;
         let offset =
             inode_table_bids[group_idx] as usize * BLOCK_SIZE + index_in_group * self.inode_size;
-        image.write_val(offset, raw);
+        // A 128-byte inode stops before the fields ext4 added, and writing the
+        // whole structure would run into the next inode.
+        let len = self.inode_size.min(size_of::<RawInode>());
+        image.write(offset, &raw.as_bytes()[..len]);
     }
 
     /// Writes every file's data and returns the inodes that describe them.
@@ -459,6 +539,55 @@ impl Ext4VolumeBuilder {
         inodes.push((BAD_EXTENT_INO, file_inode(BLOCK_SIZE as u64, 1, bad_root)));
 
         inodes.push((DEVICE_INO, device_inode(1, 3)));
+        inodes.push((FIFO_INO, base_inode(0o010644, 0, 0)));
+
+        // A symlink target past what fits inside an inode lives in a block,
+        // which is a different payload and a different read path.
+        let slow_link_bid = blocks.alloc();
+        image.write(
+            slow_link_bid as usize * BLOCK_SIZE,
+            SLOW_SYMLINK_TARGET.as_bytes(),
+        );
+        let mut slow_link = base_inode(0o120777, SLOW_SYMLINK_TARGET.len() as u64, 1);
+        slow_link.flags = EXTENTS_FL;
+        slow_link.block = extent_root(&[(0, slow_link_bid, 1)]);
+        inodes.push((SLOW_SYMLINK_INO, slow_link));
+
+        // An inode whose link count reached zero is a deleted one, and must
+        // not be served to a lookup that still names it.
+        let mut deleted = file_inode(0, 0, extent_root(&[]));
+        deleted.link_count = 0;
+        inodes.push((DELETED_INO, deleted));
+
+        let mut inline = file_inode(16, 0, extent_root(&[]));
+        inline.flags = EXTENTS_FL | INLINE_DATA_FL;
+        inodes.push((INLINE_DATA_INO, inline));
+
+        // Ext4 still permits the ext2 block-pointer layout, which this driver
+        // does not read.
+        let mut block_mapped = file_inode(BLOCK_SIZE as u64, 1, [0u8; EXTENT_ROOT_LEN]);
+        block_mapped.flags = 0;
+        inodes.push((BLOCK_MAPPED_INO, block_mapped));
+
+        // A directory of two blocks, so that a reader has to cross from one to
+        // the next rather than stopping at the end of the first.
+        let wide_dir_bid = blocks.alloc_run(2);
+        image.write(
+            wide_dir_bid as usize * BLOCK_SIZE,
+            &dir_block(&named_entries(&WIDE_DIR_FIRST_BLOCK, WIDE_DIR_INO)),
+        );
+        image.write(
+            (wide_dir_bid + 1) as usize * BLOCK_SIZE,
+            &dir_block(&named_entries(&WIDE_DIR_SECOND_BLOCK, WIDE_DIR_INO)),
+        );
+        inodes.push((
+            WIDE_DIR_INO,
+            dir_inode(
+                2 * BLOCK_SIZE as u64,
+                2,
+                extent_root(&[(0, wide_dir_bid, 2)]),
+            ),
+        ));
 
         let second_bid = blocks.alloc_in_group(1);
         image.fill(second_bid, SECOND_GROUP_INO as u8);
@@ -596,18 +725,42 @@ pub(super) fn extent_root(extents: &[(u32, u64, u16)]) -> [u8; EXTENT_ROOT_LEN] 
     root
 }
 
-/// Builds an index node that lives in an inode and points at leaf blocks.
-pub(super) fn extent_index_root(children: &[(u32, u64)]) -> [u8; EXTENT_ROOT_LEN] {
+/// Builds an index node for an inode, at the given depth.
+///
+/// The depth states how many levels of node sit below this one, so a root at
+/// depth 2 points at index nodes that point at leaves.
+pub(super) fn extent_index_root_at_depth(
+    children: &[(u32, u64)],
+    depth: u16,
+) -> [u8; EXTENT_ROOT_LEN] {
     let max = ((EXTENT_ROOT_LEN - EXTENT_ENTRY_LEN) / EXTENT_ENTRY_LEN) as u16;
     assert!(children.len() <= max as usize);
 
     let mut root = [0u8; EXTENT_ROOT_LEN];
-    root[..EXTENT_ENTRY_LEN].copy_from_slice(&extent_header(children.len() as u16, max, 1));
+    root[..EXTENT_ENTRY_LEN].copy_from_slice(&extent_header(children.len() as u16, max, depth));
     for (entry_idx, &(block, leaf)) in children.iter().enumerate() {
         let offset = EXTENT_ENTRY_LEN * (entry_idx + 1);
         root[offset..offset + EXTENT_ENTRY_LEN].copy_from_slice(&extent_index_entry(block, leaf));
     }
     root
+}
+
+/// Builds an index node one level above the leaves, for an inode.
+pub(super) fn extent_index_root(children: &[(u32, u64)]) -> [u8; EXTENT_ROOT_LEN] {
+    extent_index_root_at_depth(children, 1)
+}
+
+/// Builds an index node that occupies a whole block.
+pub(super) fn extent_index_block(children: &[(u32, u64)], depth: u16) -> Vec<u8> {
+    let max = ((BLOCK_SIZE - EXTENT_ENTRY_LEN) / EXTENT_ENTRY_LEN) as u16;
+    let mut block = vec![0u8; BLOCK_SIZE];
+    block[..EXTENT_ENTRY_LEN].copy_from_slice(&extent_header(children.len() as u16, max, depth));
+    for (entry_idx, &(logical, leaf)) in children.iter().enumerate() {
+        let offset = EXTENT_ENTRY_LEN * (entry_idx + 1);
+        block[offset..offset + EXTENT_ENTRY_LEN]
+            .copy_from_slice(&extent_index_entry(logical, leaf));
+    }
+    block
 }
 
 /// Builds a leaf node that occupies a whole block.
@@ -648,6 +801,15 @@ fn dir_block(entries: &[(&str, Ext4Ino, u8)]) -> Vec<u8> {
 }
 
 const EXTENTS_FL: u32 = 1 << 19;
+const INLINE_DATA_FL: u32 = 1 << 28;
+
+/// Builds directory entries that all name one inode.
+///
+/// A fixture directory whose test is about how its blocks are walked needs
+/// names and nothing else, so every entry points at the directory itself.
+fn named_entries(names: &[&'static str], ino: Ext4Ino) -> Vec<(&'static str, Ext4Ino, u8)> {
+    names.iter().map(|&name| (name, ino, 2)).collect()
+}
 
 fn base_inode(mode: u16, size: u64, nblocks: u32) -> RawInode {
     let mut raw = RawInode::new_zeroed();

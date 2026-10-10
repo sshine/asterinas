@@ -387,7 +387,8 @@ mod test {
 
     use super::*;
     use crate::fs::fs_impls::ext4::test_utils::{
-        Ext4MemoryDisk, assert_errno, extent_index_root, extent_leaf_block, extent_root,
+        Ext4MemoryDisk, assert_errno, extent_index_block, extent_index_root,
+        extent_index_root_at_depth, extent_leaf_block, extent_root,
     };
 
     /// Blocks on the scratch device, which is large enough for every address
@@ -553,6 +554,40 @@ mod test {
         let root = extent_root(&[(0, VOLUME_BLOCKS - 1, 4)]);
 
         assert_errno(lookup(root, &disk, 0, 4), Errno::EUCLEAN);
+    }
+
+    /// Two levels of index node above the leaves, which is where a walk that
+    /// assumes a single level stops at an index entry and reads it as an
+    /// extent.
+    #[ktest]
+    fn a_tree_two_levels_deep_is_walked_to_its_leaf() {
+        let disk = scratch_disk();
+        let (index_bid, leaf_bid) = (8, 9);
+        disk.write_block(index_bid, &extent_index_block(&[(0, leaf_bid)], 1));
+        disk.write_block(leaf_bid, &extent_leaf_block(&[(0, 20, 4)]));
+        let root = extent_index_root_at_depth(&[(0, index_bid)], 2);
+
+        assert_eq!(
+            lookup(root, &disk, 2, 2).expect("should map"),
+            Mapping::Mapped { start: 22, len: 2 }
+        );
+    }
+
+    /// A tree deeper than the format allows must stop rather than follow a
+    /// cycle that a corrupt image could describe.
+    #[ktest]
+    fn a_tree_deeper_than_the_format_allows_is_rejected() {
+        let disk = scratch_disk();
+        // Every node claims to be an index one level above the next, and the
+        // chain never reaches a leaf.
+        for bid in 8..16 {
+            disk.write_block(bid, &extent_index_block(&[(0, bid + 1)], 1));
+        }
+
+        assert_errno(
+            lookup(extent_index_root_at_depth(&[(0, 8)], 2), &disk, 0, 1),
+            Errno::EUCLEAN,
+        );
     }
 
     #[ktest]

@@ -2,10 +2,7 @@
 
 //! Re-exports used throughout the ext2 module.
 
-pub(super) use core::{
-    ops::Range,
-    time::Duration,
-};
+pub(super) use core::{ops::Range, time::Duration};
 
 pub(super) use align_ext::AlignExt;
 pub(super) use aster_block::{
