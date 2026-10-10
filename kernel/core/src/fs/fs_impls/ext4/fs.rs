@@ -210,7 +210,8 @@ mod test {
 
     use super::*;
     use crate::fs::fs_impls::ext4::test_utils::{
-        Ext4MemoryDisk, Ext4VolumeBuilder, SECOND_GROUP_INO, assert_errno,
+        Ext4MemoryDisk, Ext4VolumeBuilder, HELLO_INO, INODES_PER_GROUP, SECOND_GROUP_INO,
+        assert_errno,
     };
 
     /// A zeroed device carries no magic number, so the volume is not ours.
@@ -277,6 +278,54 @@ mod test {
                 .inode_type(),
             InodeType::File
         );
+    }
+
+    /// An inode past the point a group says its table was written holds
+    /// whatever was on the disk before, so it must not be served.
+    ///
+    /// The count is only maintained on a volume that checksums its group
+    /// descriptors, which is why the fixture declares the stock features.
+    #[ktest]
+    fn an_inode_past_the_written_part_of_a_table_is_refused() {
+        let volume = Ext4VolumeBuilder::new()
+            .stock_features()
+            .itable_unused(INODES_PER_GROUP - 10)
+            .build();
+        let fs = open(volume.disk.clone(), FsFlags::empty(), None).expect("should mount");
+        let ext4 = fs.downcast_ref::<Ext4>().expect("should be an ext4 volume");
+
+        // Inode 11 sits at index 10, one past the ten that were written.
+        assert_errno(ext4.read_inode(HELLO_INO), Errno::ENOENT);
+    }
+
+    #[ktest]
+    fn an_inode_inside_the_written_part_of_a_table_is_readable() {
+        let volume = Ext4VolumeBuilder::new()
+            .stock_features()
+            .itable_unused(INODES_PER_GROUP - 11)
+            .build();
+        let fs = open(volume.disk.clone(), FsFlags::empty(), None).expect("should mount");
+        let ext4 = fs.downcast_ref::<Ext4>().expect("should be an ext4 volume");
+
+        assert_eq!(
+            ext4.read_inode(HELLO_INO)
+                .expect("should read")
+                .inode_type(),
+            InodeType::File
+        );
+    }
+
+    /// Without those features the count means nothing, so every inode in the
+    /// table is readable whatever it says.
+    #[ktest]
+    fn the_written_count_is_ignored_when_nothing_maintains_it() {
+        let volume = Ext4VolumeBuilder::new()
+            .itable_unused(INODES_PER_GROUP)
+            .build();
+        let fs = open(volume.disk.clone(), FsFlags::empty(), None).expect("should mount");
+        let ext4 = fs.downcast_ref::<Ext4>().expect("should be an ext4 volume");
+
+        assert!(ext4.read_inode(HELLO_INO).is_ok());
     }
 
     #[ktest]

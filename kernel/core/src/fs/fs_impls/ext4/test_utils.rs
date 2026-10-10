@@ -232,7 +232,7 @@ pub(super) const FREE_INODES: u32 = 40;
 
 const NR_GROUPS: usize = 2;
 const BLOCKS_PER_GROUP: u32 = 128;
-const INODES_PER_GROUP: u32 = 32;
+pub(super) const INODES_PER_GROUP: u32 = 32;
 pub(super) const TOTAL_BLOCKS: u32 = BLOCKS_PER_GROUP * NR_GROUPS as u32;
 pub(super) const TOTAL_INODES: u32 = INODES_PER_GROUP * NR_GROUPS as u32;
 
@@ -313,6 +313,7 @@ pub(super) struct Ext4VolumeBuilder {
     desc_size: usize,
     inode_size: usize,
     stock_features: bool,
+    itable_unused: u32,
     corrupt_inode_table: Option<(usize, u64)>,
 }
 
@@ -322,6 +323,7 @@ impl Ext4VolumeBuilder {
             desc_size: 64,
             inode_size: 256,
             stock_features: false,
+            itable_unused: 0,
             corrupt_inode_table: None,
         }
     }
@@ -342,6 +344,13 @@ impl Ext4VolumeBuilder {
     /// Declares the features `mkfs.ext4` sets when given no options.
     pub(super) fn stock_features(mut self) -> Self {
         self.stock_features = true;
+        self
+    }
+
+    /// Declares how many inodes at the end of group 0's table were never
+    /// written, as a volume that checksums its descriptors records.
+    pub(super) fn itable_unused(mut self, count: u32) -> Self {
+        self.itable_unused = count;
         self
     }
 
@@ -420,6 +429,9 @@ impl Ext4VolumeBuilder {
             raw.inode_table_lo = inode_table_bid as u32;
             raw.free_blocks_count_lo = (BLOCKS_PER_GROUP as u64 - inode_table_blocks - 4) as u16;
             raw.free_inodes_count_lo = (INODES_PER_GROUP - 16) as u16;
+            if group_idx == 0 {
+                raw.itable_unused_lo = self.itable_unused as u16;
+            }
 
             if let Some((corrupt_idx, bid)) = self.corrupt_inode_table
                 && corrupt_idx == group_idx
