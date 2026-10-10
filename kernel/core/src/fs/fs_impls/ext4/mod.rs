@@ -3,40 +3,79 @@
 //! Ext4 filesystem implementation.
 //!
 //! This module is the entry point for ext4 support in Asterinas. A caller
-//! registers `Ext4` as a filesystem type via `init`, after which the VFS
-//! can mount ext4 volumes and operate on them through the standard
-//! filesystem trait interfaces.
+//! registers `Ext4` as a filesystem type via `init`, after which the VFS can
+//! mount ext4 volumes and read them through the standard filesystem trait
+//! interfaces. Buffered I/O is delegated to the `PageCache` subsystem; this
+//! module does not cache block data itself.
 //!
-//! The Fourth Extended File System (ext4) shares its block group layout and
-//! allocation bitmaps with ext2, and differs chiefly in how an inode maps
-//! logical blocks: ext2 walks a tree of indirect block pointers, while ext4
-//! stores an extent tree rooted inline in the inode. The two formats also
-//! share the magic number 0xEF53 and are told apart by the feature words in
-//! the superblock.
+//! Ext4 is the default Linux filesystem of the last two decades and the
+//! on-disk format that ordinary Linux tooling produces. It descends from ext2
+//! and ext3 and shares their magic number, but replaces the block-pointer map
+//! with extent trees and adds journalling, 64-bit block addresses, large
+//! inodes with nanosecond timestamps, hashed directories, and checksums
+//! throughout.
 //!
-//! # Feature policy
+//! # What this iteration covers
 //!
-//! Three feature words in the superblock describe what a volume requires of
-//! its driver. Incompatible features that this driver does not implement
-//! reject the mount; read-only-compatible ones that it cannot maintain
-//! force the mount read-only rather than refusing it, so that a volume made
-//! by a stock `mkfs.ext4` can still be read.
+//! Mounting and reading: extent-mapped files, linear and hash-indexed
+//! directories, symbolic links, and special files. Volumes mount read-only,
+//! and every operation that would change one reports `EROFS`. Journalling,
+//! metadata checksum verification, extended attributes, inline data and
+//! encryption are not implemented; `features` describes which of them refuse a
+//! volume and which only force it read-only.
+//!
+//! # On-disk layout
+//!
+//! An ext4 volume is divided into fixed-size block groups, each with a block
+//! bitmap, an inode bitmap, an inode table, and data blocks. The superblock
+//! sits 1024 bytes into the volume and the block group descriptor table
+//! follows it. `flex_bg` lets several groups keep their metadata together in
+//! one of them, so a group's metadata need not lie inside it.
+//!
+//! Files and directories are inodes, and an inode maps its logical blocks onto
+//! the device through a tree of extents rooted in the 60-byte `i_block` area.
+//!
+//! # Module structure
+//!
+//! | Module         | Responsibility                                      |
+//! |----------------|-----------------------------------------------------|
+//! | `fs`           | Filesystem-level state: superblock, groups, inodes  |
+//! | `inode`        | Inode decoding, file I/O, directories, symlinks     |
+//! | `block_group`  | The block group descriptor table                    |
+//! | `super_block`  | On-disk superblock parsing and validation           |
+//! | `features`     | Feature words and the mount policy they imply       |
+//! | `impl_for_vfs` | Wires ext4 types into the VFS trait interfaces      |
+//! | `fs_type`      | `FsType` registration glue                          |
+//! | `prelude`      | Common imports shared across submodules             |
 //!
 //! # References
 //!
 //! - <https://www.kernel.org/doc/html/latest/filesystems/ext4/index.html>
 
+// Set this module's log prefix for `ostd::log`.
+macro_rules! __log_prefix {
+    () => {
+        "ext4: "
+    };
+}
+
+pub(crate) use fs::Ext4;
+pub(crate) use inode::{FilePerm, Inode};
+
 pub(in crate::fs) use self::fs_type::EXT4_TYPE;
 use crate::fs::vfs::registry;
 
+mod block_group;
 mod features;
 mod fs;
 mod fs_type;
+mod impl_for_vfs;
+mod inode;
 mod prelude;
 mod super_block;
 
 #[cfg(ktest)]
-mod test_utils;
+pub(in crate::fs) mod test_utils;
 
 /// Registers the ext4 filesystem type with the VFS registry.
 pub(super) fn init() {
@@ -49,7 +88,7 @@ pub(super) fn init() {
 /// particular order, so every test that reaches the registry calls this
 /// first. Registration itself is not idempotent, hence the guard.
 #[cfg(ktest)]
-fn init_for_ktest() {
+pub(in crate::fs) fn init_for_ktest() {
     use spin::Once;
 
     static INIT: Once<()> = Once::new();

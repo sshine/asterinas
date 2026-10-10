@@ -39,7 +39,7 @@ use aster_cmdline::parse::ParamStorage;
 use spin::once::Once;
 
 use super::{
-    ext2,
+    ext2, ext4,
     vfs::{
         file_system::FsFlags,
         path::{FsPath, Mount, MountNamespace, Path, PathResolver, PerMountFlags},
@@ -48,8 +48,11 @@ use super::{
 };
 use crate::prelude::*;
 
-/// Filesystem types supported for the root filesystem.
-pub(crate) static SUPPORTED_ROOTFS_TYPES: &[&dyn DynFsType] = &[&ext2::EXT2_TYPE];
+/// Filesystem types supported for the root filesystem, tried in order.
+///
+/// ext4 comes last because the two drivers refuse each other's volumes on the
+/// feature words, so the order only decides which one is asked first.
+pub(crate) static SUPPORTED_ROOTFS_TYPES: &[&dyn DynFsType] = &[&ext2::EXT2_TYPE, &ext4::EXT4_TYPE];
 
 /// Mounts and switches to the root filesystem configured by the kernel command line.
 ///
@@ -201,3 +204,25 @@ static RO_PARAM: SetRootMountReadOnly = SetRootMountReadOnly;
 static RW_PARAM: SetRootMountReadWrite = SetRootMountReadWrite;
 aster_cmdline::define_flag_param!("ro", RO_PARAM);
 aster_cmdline::define_flag_param!("rw", RW_PARAM);
+
+#[cfg(ktest)]
+mod test {
+    use ostd::prelude::ktest;
+
+    use super::*;
+    use crate::fs::fs_impls::ext4::{init_for_ktest, test_utils::volume_disk};
+
+    /// The candidate list is what lets one root device be offered to several
+    /// drivers in turn, and it only works because a driver that cannot claim a
+    /// volume says so with `EINVAL`.
+    #[ktest]
+    fn an_ext4_volume_falls_through_ext2_to_ext4() {
+        init_for_ktest();
+
+        let fs_and_root =
+            open_rootfs_from_candidates(volume_disk(), SUPPORTED_ROOTFS_TYPES, FsFlags::empty())
+                .expect("an ext4 volume should find a root filesystem type");
+
+        assert_eq!(fs_and_root.fs().name(), "ext4");
+    }
+}

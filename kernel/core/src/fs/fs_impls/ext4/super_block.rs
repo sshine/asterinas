@@ -21,10 +21,7 @@
 
 use ostd::const_assert;
 
-use super::{
-    features::{FeatureCompat, FeatureIncompat, FeatureRoCompat},
-    prelude::*,
-};
+use super::{features, features::FeatureIncompat, prelude::*};
 
 /// The ext2/ext3/ext4 magic number.
 pub(super) const MAGIC_NUM: u16 = 0xef53;
@@ -38,27 +35,60 @@ const SUPER_BLOCK_SIZE: usize = 1024;
 const LOG_BLOCK_SIZE_4K: u32 = 2;
 
 /// Validated, Rust-typed in-memory representation of the ext4 superblock.
-//
-// Most fields describe layout that only the read path consumes, so they are
-// parsed and validated here before anything reads them.
-#[expect(dead_code)]
+///
+/// Feature words stay raw rather than becoming bitflags because the mount
+/// policy turns on bits this driver does not know, and a truncating conversion
+/// would discard exactly those.
 #[derive(Clone, Copy, Debug)]
 pub(super) struct SuperBlock {
-    /// Size of a block in bytes. Always `BLOCK_SIZE` for now.
-    pub block_size: usize,
     /// Size of an on-disk inode record in bytes.
     pub inode_size: usize,
     /// Size of an on-disk block group descriptor in bytes, 32 or 64.
     pub desc_size: usize,
     pub blocks_count: u64,
+    pub free_blocks_count: u64,
+    pub reserved_blocks_count: u64,
     pub inodes_count: u32,
+    pub free_inodes_count: u32,
     pub first_data_block: u32,
     pub blocks_per_group: u32,
     pub inodes_per_group: u32,
-    pub first_ino: u32,
-    pub feature_compat: FeatureCompat,
-    pub feature_incompat: FeatureIncompat,
-    pub feature_ro_compat: FeatureRoCompat,
+    pub feature_compat: u32,
+    pub feature_incompat: u32,
+    pub feature_ro_compat: u32,
+}
+
+impl SuperBlock {
+    /// Returns the number of block groups on the volume.
+    pub(super) fn nr_block_groups(&self) -> usize {
+        let data_blocks = self.blocks_count - self.first_data_block as u64;
+        data_blocks.div_ceil(self.blocks_per_group as u64) as usize
+    }
+
+    /// Returns the block holding the first group descriptor.
+    ///
+    /// The descriptor table follows the block that holds the superblock, which
+    /// for 4096-byte blocks is block 0.
+    pub(super) fn group_descriptors_bid(&self) -> u64 {
+        self.first_data_block as u64 + 1
+    }
+
+    /// Returns the number of blocks one group's inode table occupies.
+    pub(super) fn inode_table_blocks(&self) -> u64 {
+        (self.inodes_per_group as u64 * self.inode_size as u64) / BLOCK_SIZE as u64
+    }
+
+    /// Splits an inode number into its group index and its index within that
+    /// group's inode table.
+    pub(super) fn locate_inode(&self, ino: Ext4Ino) -> Result<(usize, u32)> {
+        if ino == 0 || ino > self.inodes_count {
+            return_errno_with_message!(Errno::ENOENT, "inode number out of range");
+        }
+
+        let group_idx = ((ino - 1) / self.inodes_per_group) as usize;
+        let index_in_group = (ino - 1) % self.inodes_per_group;
+        Ok((group_idx, index_in_group))
+    }
 }
 
 impl TryFrom<RawSuperBlock> for SuperBlock {
@@ -78,31 +108,17 @@ impl TryFrom<RawSuperBlock> for SuperBlock {
             return_errno_with_message!(Errno::EINVAL, "unsupported block size");
         }
 
-        // An unknown incompatible bit means the volume uses a layout this
-        // driver cannot parse, so the mask lists what is supported. EINVAL in
-        // particular, because the root filesystem candidate list treats any
-        // other error as fatal rather than moving on to the next type.
-        let allowed_incompat = FeatureIncompat::FILETYPE.bits()
-            | FeatureIncompat::EXTENTS.bits()
-            | FeatureIncompat::SIZE_64BIT.bits()
-            | FeatureIncompat::FLEX_BG.bits();
-        if (sb.feature_incompat & !allowed_incompat) != 0 {
-            return_errno_with_message!(Errno::EINVAL, "unsupported incompat feature");
-        }
-        let feature_incompat = FeatureIncompat::from_bits_truncate(sb.feature_incompat);
+        features::check_incompat(sb.feature_incompat)?;
 
         // Without extents the volume is an ext2 or ext3 one, which the ext2
         // driver handles.
-        if !feature_incompat.contains(FeatureIncompat::EXTENTS) {
+        if (sb.feature_incompat & FeatureIncompat::EXTENTS.bits()) == 0 {
             return_errno_with_message!(Errno::EINVAL, "no extent support, not an ext4 volume");
         }
 
-        let feature_compat = FeatureCompat::from_bits_truncate(sb.feature_compat);
-        let feature_ro_compat = FeatureRoCompat::from_bits_truncate(sb.feature_ro_compat);
-
         // A 64-bit volume states its descriptor size; a 32-bit one leaves the
         // field zero and uses the historical 32 bytes.
-        let desc_size = if feature_incompat.contains(FeatureIncompat::SIZE_64BIT) {
+        let desc_size = if (sb.feature_incompat & FeatureIncompat::SIZE_64BIT.bits()) != 0 {
             let desc_size = sb.desc_size as usize;
             if desc_size < 64 || !desc_size.is_power_of_two() || desc_size > BLOCK_SIZE {
                 return_errno_with_message!(Errno::EINVAL, "invalid group descriptor size");
@@ -128,24 +144,40 @@ impl TryFrom<RawSuperBlock> for SuperBlock {
             return_errno_with_message!(Errno::EINVAL, "group is larger than its bitmap");
         }
 
+        // One inode must never straddle a block boundary, which holds for every
+        // volume `mkfs.ext4` produces and which the inode reader relies on.
+        if !(sb.inodes_per_group as usize * inode_size).is_multiple_of(BLOCK_SIZE) {
+            return_errno_with_message!(
+                Errno::EINVAL,
+                "inode table is not a whole number of blocks"
+            );
+        }
+
         let blocks_count = ((sb.blocks_count_hi as u64) << 32) | sb.blocks_count_lo as u64;
         if blocks_count <= sb.first_data_block as u64 {
             return_errno_with_message!(Errno::EINVAL, "invalid blocks count");
         }
 
+        if sb.inodes_count == 0 {
+            return_errno_with_message!(Errno::EINVAL, "volume has no inodes");
+        }
+
         Ok(Self {
-            block_size: BLOCK_SIZE,
             inode_size,
             desc_size,
             blocks_count,
+            free_blocks_count: ((sb.free_blocks_count_hi as u64) << 32)
+                | sb.free_blocks_count_lo as u64,
+            reserved_blocks_count: ((sb.reserved_blocks_count_hi as u64) << 32)
+                | sb.reserved_blocks_count_lo as u64,
             inodes_count: sb.inodes_count,
+            free_inodes_count: sb.free_inodes_count,
             first_data_block: sb.first_data_block,
             blocks_per_group: sb.blocks_per_group,
             inodes_per_group: sb.inodes_per_group,
-            first_ino: sb.first_ino,
-            feature_compat,
-            feature_incompat,
-            feature_ro_compat,
+            feature_compat: sb.feature_compat,
+            feature_incompat: sb.feature_incompat,
+            feature_ro_compat: sb.feature_ro_compat,
         })
     }
 }
@@ -299,11 +331,38 @@ mod test {
     fn a_valid_super_block_parses() {
         let sb = SuperBlock::try_from(make_valid_raw_super_block()).expect("should parse");
 
-        assert_eq!(sb.block_size, BLOCK_SIZE);
         assert_eq!(sb.inode_size, 256);
         assert_eq!(sb.desc_size, 64);
         assert_eq!(sb.blocks_per_group, 32768);
-        assert!(sb.feature_incompat.contains(FeatureIncompat::EXTENTS));
+        assert_ne!(sb.feature_incompat & FeatureIncompat::EXTENTS.bits(), 0);
+    }
+
+    /// A volume whose last group is short still has that group counted, which
+    /// a truncating division would drop along with every inode in it.
+    #[ktest]
+    fn a_partly_filled_last_group_still_counts() {
+        let mut raw = make_valid_raw_super_block();
+        raw.blocks_per_group = 128;
+        raw.blocks_count_lo = 128 * 3 + 1;
+
+        let sb = SuperBlock::try_from(raw).expect("should parse");
+
+        assert_eq!(sb.nr_block_groups(), 4);
+    }
+
+    #[ktest]
+    fn inode_numbers_split_into_group_and_index() {
+        let mut raw = make_valid_raw_super_block();
+        raw.inodes_per_group = 16;
+        raw.inodes_count = 32;
+
+        let sb = SuperBlock::try_from(raw).expect("should parse");
+
+        assert_eq!(sb.locate_inode(1).expect("inode 1 exists"), (0, 0));
+        assert_eq!(sb.locate_inode(16).expect("inode 16 exists"), (0, 15));
+        assert_eq!(sb.locate_inode(17).expect("inode 17 exists"), (1, 0));
+        assert_errno(sb.locate_inode(0), Errno::ENOENT);
+        assert_errno(sb.locate_inode(33), Errno::ENOENT);
     }
 
     #[ktest]
