@@ -39,7 +39,7 @@
 
 use ostd::const_assert;
 
-use crate::fs::fs_impls::ext4::prelude::*;
+use crate::fs::fs_impls::ext4::{fs::Ext4, prelude::*};
 
 /// Number of bytes of `i_block` that hold the root node.
 pub(super) const EXTENT_ROOT_LEN: usize = 60;
@@ -51,7 +51,7 @@ const MAX_DEPTH: u16 = 5;
 
 /// Lengths above this mark an extent as unwritten, and the excess is the
 /// actual length.
-const UNWRITTEN_MARK: u16 = 32768;
+pub(super) const UNWRITTEN_MARK: u16 = 32768;
 
 /// What backs a run of logical blocks starting at a requested one.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -208,6 +208,386 @@ impl ExtentTree {
     }
 }
 
+/// The write side of the tree.
+///
+/// # Shape
+///
+/// A tree starts at depth 0, with its extents in the inode's own sixty bytes,
+/// which hold four. When a fifth is needed the tree grows to depth 1: the four
+/// move into a leaf block and the root becomes an index node pointing at it.
+/// Each leaf block holds 340 extents and the root holds four index entries, so
+/// the tree tops out at 1360 extents.
+///
+/// A deeper tree is what ext4 uses past that point, and this driver does not
+/// build one yet; a file that needs it is refused rather than mis-written.
+impl ExtentTree {
+    /// Maps `len` logical blocks at `iblock` onto `start` and onwards.
+    ///
+    /// The run is merged into the extent before it where the two are adjacent
+    /// both logically and on the device, which is what keeps a file written
+    /// from beginning to end down to a single extent.
+    pub(super) fn insert(
+        &mut self,
+        fs: &Ext4,
+        iblock: Iblock,
+        start: Ext4Bid,
+        len: u16,
+    ) -> Result<()> {
+        debug_assert!(len > 0 && len <= UNWRITTEN_MARK);
+        self.check_address(start, len as u64)?;
+
+        if self.depth()? == 0 {
+            let mut root = self.root;
+            match insert_into_node(&mut root, iblock, start, len)? {
+                Inserted::Yes => {
+                    self.root = root;
+                    return Ok(());
+                }
+                Inserted::NodeFull => {
+                    self.grow(fs)?;
+                }
+            }
+        }
+
+        self.insert_into_leaf(fs, iblock, start, len)
+    }
+
+    /// Frees every block mapped at or after `from`.
+    ///
+    /// Extents wholly past the boundary go away; one straddling it is
+    /// shortened. Nothing reclaims an index node that empties, which costs a
+    /// block per emptied leaf until the file is removed.
+    pub(super) fn truncate(&mut self, fs: &Ext4, from: Iblock) -> Result<u64> {
+        if self.depth()? == 0 {
+            let mut root = self.root;
+            let freed = truncate_node(fs, &mut root, from)?;
+            self.root = root;
+            return Ok(freed);
+        }
+
+        let children = self.children()?;
+        let mut root = self.root;
+        let mut kept = 0;
+        let mut freed = 0;
+        for (child_iblock, leaf_bid) in children {
+            let mut leaf = read_node(fs, leaf_bid)?;
+            freed += truncate_node(fs, &mut leaf, from)?;
+
+            let header = RawExtentHeader::from_first_bytes(&leaf);
+            if header.entries == 0 && child_iblock >= from {
+                // The leaf is empty and nothing will be added back before it,
+                // so the block that held it is free.
+                fs.free_blocks(leaf_bid..leaf_bid + 1)?;
+                freed += 1;
+                continue;
+            }
+
+            fs.write_metadata(Bid::new(leaf_bid).to_offset(), &leaf)?;
+            set_entry(&mut root, kept, &extent_index_bytes(child_iblock, leaf_bid));
+            kept += 1;
+        }
+
+        set_entries(&mut root, kept as u16);
+        self.root = root;
+        Ok(freed)
+    }
+
+    /// Returns the bytes that belong in the inode's `i_block` area.
+    pub(super) fn root_bytes(&self) -> [u8; EXTENT_ROOT_LEN] {
+        self.root
+    }
+
+    /// Builds an empty tree, for a file that has just been created.
+    pub(super) fn empty(volume_blocks: u64) -> Self {
+        let mut root = [0u8; EXTENT_ROOT_LEN];
+        let max = ((EXTENT_ROOT_LEN - size_of::<RawExtentHeader>()) / ENTRY_LEN) as u16;
+        write_header(&mut root, 0, max, 0);
+
+        Self {
+            root,
+            volume_blocks,
+        }
+    }
+
+    fn depth(&self) -> Result<u16> {
+        Ok(Node::new(&self.root, None)?.depth())
+    }
+
+    /// Returns the index entries of a root that has them.
+    fn children(&self) -> Result<Vec<(Iblock, Ext4Bid)>> {
+        let node = Node::new(&self.root, None)?;
+        Ok((0..node.entries())
+            .map(|entry_idx| {
+                let index = node.index(entry_idx);
+                (index.block, index.leaf())
+            })
+            .collect())
+    }
+
+    /// Moves a full root into a leaf block and makes the root point at it.
+    fn grow(&mut self, fs: &Ext4) -> Result<()> {
+        let leaf_bid = fs.alloc_blocks(0, 1)?.start;
+
+        let mut leaf = vec![0u8; BLOCK_SIZE];
+        let max = ((BLOCK_SIZE - size_of::<RawExtentHeader>()) / ENTRY_LEN) as u16;
+        // The borrow of the root ends with this block, so that the new one can
+        // be written over it below.
+        let first_iblock = {
+            let root = Node::new(&self.root, None)?;
+            let entries = root.entries();
+            write_header(&mut leaf, entries as u16, max, 0);
+            for entry_idx in 0..entries {
+                set_entry(&mut leaf, entry_idx, root.entry_bytes(entry_idx));
+            }
+            root.extent(0).block
+        };
+
+        fs.write_metadata(Bid::new(leaf_bid).to_offset(), &leaf)?;
+
+        let mut new_root = [0u8; EXTENT_ROOT_LEN];
+        let root_max = ((EXTENT_ROOT_LEN - size_of::<RawExtentHeader>()) / ENTRY_LEN) as u16;
+        write_header(&mut new_root, 1, root_max, 1);
+        set_entry(
+            &mut new_root,
+            0,
+            &extent_index_bytes(first_iblock, leaf_bid),
+        );
+        self.root = new_root;
+        Ok(())
+    }
+
+    /// Inserts into the leaf of a depth-1 tree, adding a leaf if the one that
+    /// should hold the run is full.
+    fn insert_into_leaf(
+        &mut self,
+        fs: &Ext4,
+        iblock: Iblock,
+        start: Ext4Bid,
+        len: u16,
+    ) -> Result<()> {
+        if self.depth()? != 1 {
+            return_errno_with_message!(
+                Errno::EFBIG,
+                "the file needs an extent tree deeper than this driver builds"
+            );
+        }
+
+        let children = self.children()?;
+        // The last child whose range begins at or before the new run is the
+        // one that should hold it.
+        let child_idx = children
+            .iter()
+            .rposition(|&(child_iblock, _)| child_iblock <= iblock)
+            .unwrap_or(0);
+        let (_, leaf_bid) = children[child_idx];
+
+        let mut leaf = read_node(fs, leaf_bid)?;
+        match insert_into_node(&mut leaf, iblock, start, len)? {
+            Inserted::Yes => {
+                fs.write_metadata(Bid::new(leaf_bid).to_offset(), &leaf)?;
+                return Ok(());
+            }
+            Inserted::NodeFull => {}
+        }
+
+        // Splitting a full leaf in the middle is what a general insert needs.
+        // Appending past its end only needs a new leaf beside it, which is the
+        // case a file written from beginning to end takes.
+        {
+            let last = Node::new(&leaf, Some(0))?;
+            let last_extent = last.extent(last.entries() - 1);
+            let (last_len, _) = last_extent.decoded_len()?;
+            if iblock < last_extent.block + last_len as Iblock {
+                return_errno_with_message!(
+                    Errno::EFBIG,
+                    "splitting a full extent leaf is not implemented"
+                );
+            }
+        }
+
+        if children.len() >= Node::new(&self.root, None)?.max() as usize {
+            return_errno_with_message!(
+                Errno::EFBIG,
+                "the file needs an extent tree deeper than this driver builds"
+            );
+        }
+
+        let new_leaf_bid = fs.alloc_blocks(leaf_bid, 1)?.start;
+        let mut new_leaf = vec![0u8; BLOCK_SIZE];
+        let max = ((BLOCK_SIZE - size_of::<RawExtentHeader>()) / ENTRY_LEN) as u16;
+        write_header(&mut new_leaf, 1, max, 0);
+        set_entry(&mut new_leaf, 0, &extent_bytes(iblock, start, len));
+        fs.write_metadata(Bid::new(new_leaf_bid).to_offset(), &new_leaf)?;
+
+        let mut root = self.root;
+        insert_entry_at(
+            &mut root,
+            child_idx + 1,
+            &extent_index_bytes(iblock, new_leaf_bid),
+        )?;
+        self.root = root;
+        Ok(())
+    }
+}
+
+/// Whether a node had room for a new entry.
+enum Inserted {
+    Yes,
+    NodeFull,
+}
+
+/// Adds a run to a leaf node, merging it into its predecessor where possible.
+fn insert_into_node(node: &mut [u8], iblock: Iblock, start: Ext4Bid, len: u16) -> Result<Inserted> {
+    let header = RawExtentHeader::from_first_bytes(node);
+    let entries = header.entries as usize;
+
+    // Scan for the entry this run belongs after, merging into it if the two
+    // are adjacent both logically and on the device.
+    let mut position = entries;
+    for entry_idx in 0..entries {
+        let extent = RawExtent::from_bytes(entry_bytes(node, entry_idx));
+        let (extent_len, unwritten) = extent.decoded_len()?;
+
+        if extent.block > iblock {
+            position = entry_idx;
+            break;
+        }
+
+        let ends_at = extent.block + extent_len as Iblock;
+        let joins_on = extent.start() + extent_len as u64;
+        if !unwritten
+            && ends_at == iblock
+            && joins_on == start
+            && extent_len + len as u32 <= UNWRITTEN_MARK as u32
+        {
+            set_entry(
+                node,
+                entry_idx,
+                &extent_bytes(extent.block, extent.start(), extent_len as u16 + len),
+            );
+            return Ok(Inserted::Yes);
+        }
+    }
+
+    if entries >= header.max as usize {
+        return Ok(Inserted::NodeFull);
+    }
+
+    insert_entry_at(node, position, &extent_bytes(iblock, start, len))?;
+    Ok(Inserted::Yes)
+}
+
+/// Drops or shortens every extent of a leaf at or after `from`, freeing the
+/// blocks they named.
+fn truncate_node(fs: &Ext4, node: &mut [u8], from: Iblock) -> Result<u64> {
+    let header = RawExtentHeader::from_first_bytes(node);
+    let entries = header.entries as usize;
+
+    let mut kept = 0;
+    let mut freed = 0;
+    for entry_idx in 0..entries {
+        let extent = RawExtent::from_bytes(entry_bytes(node, entry_idx));
+        let (len, unwritten) = extent.decoded_len()?;
+        let ends_at = extent.block + len as Iblock;
+
+        if ends_at <= from {
+            let moved = copy_entry(node, entry_idx);
+            set_entry(node, kept, &moved);
+            kept += 1;
+            continue;
+        }
+
+        let keep = from.saturating_sub(extent.block).min(len);
+        if !unwritten {
+            fs.free_blocks(extent.start() + keep as u64..extent.start() + len as u64)?;
+            freed += (len - keep) as u64;
+        }
+        if keep > 0 {
+            set_entry(
+                node,
+                kept,
+                &extent_bytes(extent.block, extent.start(), keep as u16),
+            );
+            kept += 1;
+        }
+    }
+
+    set_entries(node, kept as u16);
+    Ok(freed)
+}
+
+fn read_node(fs: &Ext4, bid: Ext4Bid) -> Result<Vec<u8>> {
+    let mut bytes = vec![0u8; BLOCK_SIZE];
+    fs.block_device()
+        .read_bytes(Bid::new(bid).to_offset(), &mut bytes)
+        .map_err(|_| Error::with_message(Errno::EIO, "failed to read an extent node"))?;
+    Ok(bytes)
+}
+
+fn entry_bytes(node: &[u8], entry_idx: usize) -> &[u8] {
+    let offset = size_of::<RawExtentHeader>() + entry_idx * ENTRY_LEN;
+    &node[offset..offset + ENTRY_LEN]
+}
+
+/// Copies one entry out, so that it can be written back elsewhere in the same
+/// node.
+fn copy_entry(node: &[u8], entry_idx: usize) -> [u8; ENTRY_LEN] {
+    let mut bytes = [0u8; ENTRY_LEN];
+    bytes.copy_from_slice(entry_bytes(node, entry_idx));
+    bytes
+}
+
+fn set_entry(node: &mut [u8], entry_idx: usize, bytes: &[u8]) {
+    let offset = size_of::<RawExtentHeader>() + entry_idx * ENTRY_LEN;
+    node[offset..offset + ENTRY_LEN].copy_from_slice(bytes);
+}
+
+/// Makes room at `position` and writes `bytes` there.
+fn insert_entry_at(node: &mut [u8], position: usize, bytes: &[u8]) -> Result<()> {
+    let header = RawExtentHeader::from_first_bytes(node);
+    let entries = header.entries as usize;
+    if entries >= header.max as usize {
+        return_errno_with_message!(Errno::EFBIG, "the extent node is full");
+    }
+
+    for entry_idx in (position..entries).rev() {
+        let moved = copy_entry(node, entry_idx);
+        set_entry(node, entry_idx + 1, &moved);
+    }
+    set_entry(node, position, bytes);
+    set_entries(node, entries as u16 + 1);
+    Ok(())
+}
+
+fn set_entries(node: &mut [u8], entries: u16) {
+    node[2..4].copy_from_slice(&entries.to_le_bytes());
+}
+
+fn write_header(node: &mut [u8], entries: u16, max: u16, depth: u16) {
+    node[0..2].copy_from_slice(&EXTENT_MAGIC.to_le_bytes());
+    node[2..4].copy_from_slice(&entries.to_le_bytes());
+    node[4..6].copy_from_slice(&max.to_le_bytes());
+    node[6..8].copy_from_slice(&depth.to_le_bytes());
+    node[8..12].copy_from_slice(&0u32.to_le_bytes());
+}
+
+fn extent_bytes(iblock: Iblock, start: Ext4Bid, len: u16) -> Vec<u8> {
+    let mut bytes = vec![0u8; ENTRY_LEN];
+    bytes[0..4].copy_from_slice(&iblock.to_le_bytes());
+    bytes[4..6].copy_from_slice(&len.to_le_bytes());
+    bytes[6..8].copy_from_slice(&((start >> 32) as u16).to_le_bytes());
+    bytes[8..12].copy_from_slice(&(start as u32).to_le_bytes());
+    bytes
+}
+
+fn extent_index_bytes(iblock: Iblock, leaf: Ext4Bid) -> Vec<u8> {
+    let mut bytes = vec![0u8; ENTRY_LEN];
+    bytes[0..4].copy_from_slice(&iblock.to_le_bytes());
+    bytes[4..8].copy_from_slice(&(leaf as u32).to_le_bytes());
+    bytes[8..10].copy_from_slice(&((leaf >> 32) as u16).to_le_bytes());
+    bytes
+}
+
 /// Returns the length of a hole that starts at `iblock`.
 ///
 /// A hole must never be reported longer than it is, because its blocks are
@@ -269,6 +649,10 @@ impl<'a> Node<'a> {
 
     fn entries(&self) -> usize {
         self.header.entries as usize
+    }
+
+    fn max(&self) -> u16 {
+        self.header.max
     }
 
     fn entry_bytes(&self, entry_idx: usize) -> &[u8] {

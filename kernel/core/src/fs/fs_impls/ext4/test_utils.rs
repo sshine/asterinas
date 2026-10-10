@@ -224,11 +224,11 @@ const STOCK_COMPAT: u32 = 0x103c;
 const STOCK_INCOMPAT: u32 = 0x22c2;
 const STOCK_RO_COMPAT: u32 = 0x46b;
 
-/// Counts the fixture superblock declares, so that `statfs` has something
-/// other than zero to report.
-pub(super) const FREE_BLOCKS: u32 = 100;
+/// Blocks the fixture superblock holds back from unprivileged writers.
 pub(super) const RESERVED_BLOCKS: u32 = 12;
-pub(super) const FREE_INODES: u32 = 40;
+
+/// First inode a file may use; the format reserves everything below.
+const FIRST_INO: Ext4Ino = 11;
 
 const NR_GROUPS: usize = 2;
 const BLOCKS_PER_GROUP: u32 = 128;
@@ -299,6 +299,9 @@ pub(super) const ROOT_ENTRIES: [(&str, Ext4Ino, u8); 16] = [
 pub(super) struct Ext4Volume {
     pub disk: Arc<dyn BlockDevice>,
     pub super_block: SuperBlock,
+    /// What the bitmaps leave free, which the superblock agrees with.
+    pub free_blocks: u32,
+    pub free_inodes: u32,
     inode_table_bids: [u64; NR_GROUPS],
 }
 
@@ -371,9 +374,11 @@ impl Ext4VolumeBuilder {
         self.write_group_descs(&mut image, &inode_table_bids, inode_table_blocks);
 
         let files = self.write_files(&mut image, &mut blocks);
+        let inos: Vec<Ext4Ino> = files.iter().map(|&(ino, _)| ino).collect();
         for (ino, raw) in files {
             self.write_inode(&mut image, &inode_table_bids, ino, &raw);
         }
+        let (free_blocks, free_inodes) = self.write_bitmaps(&mut image, &blocks, &inos);
 
         let raw_super_block = image.read_val::<RawSuperBlock>(SUPER_BLOCK_OFFSET);
         Ext4Volume {
@@ -383,6 +388,8 @@ impl Ext4VolumeBuilder {
             )) as Arc<dyn BlockDevice>,
             super_block: SuperBlock::try_from(raw_super_block)
                 .expect("the built superblock should be valid"),
+            free_blocks,
+            free_inodes,
             inode_table_bids,
         }
     }
@@ -394,9 +401,8 @@ impl Ext4VolumeBuilder {
         raw.inodes_per_group = INODES_PER_GROUP;
         raw.inodes_count = INODES_PER_GROUP * NR_GROUPS as u32;
         raw.blocks_count_lo = TOTAL_BLOCKS;
-        raw.free_blocks_count_lo = FREE_BLOCKS;
+        // The free counts are patched in once the bitmaps are written.
         raw.reserved_blocks_count_lo = RESERVED_BLOCKS;
-        raw.free_inodes_count = FREE_INODES;
         raw.inode_size = self.inode_size as u16;
         raw.desc_size = self.desc_size as u16;
         if self.stock_features {
@@ -418,7 +424,7 @@ impl Ext4VolumeBuilder {
         &self,
         image: &mut Image,
         inode_table_bids: &[u64; NR_GROUPS],
-        inode_table_blocks: u64,
+        _inode_table_blocks: u64,
     ) {
         let table_offset = BLOCK_SIZE;
         for (group_idx, &inode_table_bid) in inode_table_bids.iter().enumerate() {
@@ -427,8 +433,7 @@ impl Ext4VolumeBuilder {
             raw.block_bitmap_lo = group_first as u32 + if group_idx == 0 { 2 } else { 0 };
             raw.inode_bitmap_lo = raw.block_bitmap_lo + 1;
             raw.inode_table_lo = inode_table_bid as u32;
-            raw.free_blocks_count_lo = (BLOCKS_PER_GROUP as u64 - inode_table_blocks - 4) as u16;
-            raw.free_inodes_count_lo = (INODES_PER_GROUP - 16) as u16;
+            // The real counts are patched in once the bitmaps are written.
             if group_idx == 0 {
                 raw.itable_unused_lo = self.itable_unused as u16;
             }
@@ -464,6 +469,67 @@ impl Ext4VolumeBuilder {
         // whole structure would run into the next inode.
         let len = self.inode_size.min(size_of::<RawInode>());
         image.write(offset, &raw.as_bytes()[..len]);
+    }
+
+    /// Writes the allocation bitmaps, and the free counts that must agree with
+    /// them.
+    ///
+    /// A volume whose bitmaps say nothing is allocated would hand its own
+    /// superblock out to the first file written to it, so the fixture has to
+    /// record what it used.
+    fn write_bitmaps(
+        &self,
+        image: &mut Image,
+        blocks: &BlockAllocator,
+        inos: &[Ext4Ino],
+    ) -> (u32, u32) {
+        let (mut total_free_blocks, mut total_free_inodes) = (0, 0);
+        let bitmap_bids = [2, BLOCKS_PER_GROUP as u64];
+        for (group_idx, &bitmap_bid) in bitmap_bids.iter().enumerate() {
+            let first_block = group_idx as u64 * BLOCKS_PER_GROUP as u64;
+            let mut free = 0;
+            for offset in 0..BLOCKS_PER_GROUP as u64 {
+                if blocks.is_used(first_block + offset) {
+                    image.set_bit(bitmap_bid, offset as usize);
+                } else {
+                    free += 1;
+                }
+            }
+
+            // The inodes the format reserves are in use whether or not this
+            // fixture names them.
+            let inode_bitmap_bid = bitmap_bid + 1;
+            let mut free_inodes = INODES_PER_GROUP;
+            for index in 0..INODES_PER_GROUP {
+                let ino = group_idx as u32 * INODES_PER_GROUP + index + 1;
+                if ino < FIRST_INO || inos.contains(&ino) {
+                    image.set_bit(inode_bitmap_bid, index as usize);
+                    free_inodes -= 1;
+                }
+            }
+
+            total_free_blocks += free;
+            total_free_inodes += free_inodes;
+            self.patch_group_free_counts(image, group_idx, free, free_inodes);
+        }
+
+        // The superblock has to agree with the bitmaps, or the volume claims
+        // room it cannot hand out.
+        image.write(SUPER_BLOCK_OFFSET + 12, &total_free_blocks.to_le_bytes());
+        image.write(SUPER_BLOCK_OFFSET + 16, &total_free_inodes.to_le_bytes());
+        (total_free_blocks, total_free_inodes)
+    }
+
+    fn patch_group_free_counts(
+        &self,
+        image: &mut Image,
+        group_idx: usize,
+        free_blocks: u32,
+        free_inodes: u32,
+    ) {
+        let offset = BLOCK_SIZE + group_idx * self.desc_size;
+        image.write(offset + 12, &(free_blocks as u16).to_le_bytes());
+        image.write(offset + 14, &(free_inodes as u16).to_le_bytes());
     }
 
     /// Writes every file's data and returns the inodes that describe them.
@@ -613,9 +679,12 @@ impl Ext4VolumeBuilder {
 }
 
 /// Hands out data blocks, stepping over the metadata of each group.
+/// Hands out data blocks, stepping over the metadata of each group and
+/// recording what it used so that the bitmaps can be written to match.
 struct BlockAllocator {
     next: u64,
     reserved: [Range<u64>; NR_GROUPS],
+    used: Vec<bool>,
 }
 
 impl BlockAllocator {
@@ -624,10 +693,23 @@ impl BlockAllocator {
             0..inode_table_bids[0] + inode_table_blocks,
             BLOCKS_PER_GROUP as u64..inode_table_bids[1] + inode_table_blocks,
         ];
+        let mut used = vec![false; TOTAL_BLOCKS as usize];
+        for range in &reserved {
+            for bid in range.clone() {
+                used[bid as usize] = true;
+            }
+        }
+
         Self {
             next: reserved[0].end,
             reserved,
+            used,
         }
+    }
+
+    /// Returns whether the block at `bid` is in use.
+    fn is_used(&self, bid: u64) -> bool {
+        self.used[bid as usize]
     }
 
     fn alloc(&mut self) -> u64 {
@@ -648,6 +730,9 @@ impl BlockAllocator {
         );
 
         let bid = self.next;
+        for offset in 0..count {
+            self.used[(bid + offset) as usize] = true;
+        }
         self.next += count;
         bid
     }
@@ -682,6 +767,13 @@ impl Image {
 
     fn read_val<T: Pod>(&self, offset: usize) -> T {
         T::from_bytes(&self.bytes[offset..offset + size_of::<T>()])
+    }
+
+    /// Sets one bit of a bitmap block, as an allocation bitmap records a used
+    /// block or inode.
+    fn set_bit(&mut self, bid: u64, index: usize) {
+        let offset = bid as usize * BLOCK_SIZE + index / 8;
+        self.bytes[offset] |= 1 << (index % 8);
     }
 
     fn fill(&mut self, bid: u64, byte: u8) {

@@ -24,14 +24,14 @@ pub(super) enum IoRange {
 /// explicit rather than being served from the device.
 pub(super) struct IoRangeIter<'a> {
     range: Range<Iblock>,
-    tree: &'a ExtentTree,
+    tree: RwMutexReadGuard<'a, ExtentTree>,
     device: &'a dyn BlockDevice,
 }
 
 impl<'a> IoRangeIter<'a> {
     pub(super) fn new(
         range: Range<Iblock>,
-        tree: &'a ExtentTree,
+        tree: RwMutexReadGuard<'a, ExtentTree>,
         device: &'a dyn BlockDevice,
     ) -> Self {
         Self {

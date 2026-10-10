@@ -24,10 +24,12 @@
 //! - `RawInode` — the on-disk layout (`#[repr(C)]`), covering the classic
 //!   128-byte area and the 32 bytes ext4 adds after it.
 //!
-//! Nothing here takes a lock, because nothing here mutates: an inode is
-//! decoded once when it is read from the device and is immutable afterwards.
-//! That is a property of this iteration rather than of the format, and the
-//! write path will have to introduce the interior mutability it needs.
+//! # Locking
+//!
+//! `Inode::inner` guards everything a write can change. The inode type and
+//! number sit outside it because neither ever changes. An operation that
+//! touches two inodes, such as a rename, takes their locks in ascending inode
+//! order so that two such operations cannot deadlock against each other.
 //!
 //! # Submodules
 //!
@@ -39,11 +41,12 @@
 //! | `dir`           | Directory entry decoding, lookup, and readdir      |
 
 mod block_manager;
+mod create;
 mod dir;
 mod extent;
 mod io_range;
 
-use device_id::{DeviceId, encode_device_numbers};
+use device_id::{DeviceId, decode_device_numbers, encode_device_numbers};
 use ostd::const_assert;
 
 use self::{
@@ -83,10 +86,14 @@ impl FilePerm {
 }
 
 /// An in-memory ext4 inode.
+///
+/// The type never changes once the inode exists, so it sits outside the lock
+/// and costs nothing to read. Everything that a write can change lives in
+/// `InodeInner`.
 pub(crate) struct Inode {
     ino: Ext4Ino,
-    desc: InodeDesc,
-    payload: InodePayload,
+    type_: InodeType,
+    inner: RwMutex<InodeInner>,
     /// The in-memory endpoint of a named pipe, which the format records as a
     /// type and nothing more.
     pipe: Option<Pipe>,
@@ -94,11 +101,17 @@ pub(crate) struct Inode {
     extension: Extension,
 }
 
+/// The mutable interior of an inode.
+struct InodeInner {
+    desc: Dirty<InodeDesc>,
+    payload: InodePayload,
+}
+
 impl Debug for Inode {
     fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
         f.debug_struct("Inode")
             .field("ino", &self.ino)
-            .field("type", &self.desc.type_)
+            .field("type", &self.type_)
             .finish()
     }
 }
@@ -111,17 +124,18 @@ impl Inode {
     /// weak reference cannot yet be upgraded.
     pub(super) fn new(
         ino: Ext4Ino,
-        desc: InodeDesc,
+        desc: Dirty<InodeDesc>,
         volume_blocks: u64,
         fs: Weak<Ext4>,
     ) -> Result<Arc<Self>> {
         let payload = InodePayload::new(&desc, volume_blocks, fs.clone())?;
-        let pipe = (desc.type_ == InodeType::NamedPipe).then(Pipe::new);
+        let type_ = desc.type_;
+        let pipe = (type_ == InodeType::NamedPipe).then(Pipe::new);
 
         Ok(Arc::new(Self {
             ino,
-            desc,
-            payload,
+            type_,
+            inner: RwMutex::new(InodeInner { desc, payload }),
             pipe,
             fs,
             extension: Extension::new(),
@@ -138,35 +152,39 @@ impl Inode {
     }
 
     pub(super) fn inode_type(&self) -> InodeType {
-        self.desc.type_
+        self.type_
     }
 
     pub(super) fn file_size(&self) -> usize {
-        self.desc.size as usize
+        self.inner.read().desc.size as usize
     }
 
     pub(super) fn mode(&self) -> InodeMode {
-        InodeMode::from_bits_truncate(self.desc.perm.bits())
+        InodeMode::from_bits_truncate(self.inner.read().desc.perm.bits())
     }
 
     pub(super) fn uid(&self) -> u32 {
-        self.desc.uid
+        self.inner.read().desc.uid
     }
 
     pub(super) fn gid(&self) -> u32 {
-        self.desc.gid
+        self.inner.read().desc.gid
     }
 
     pub(super) fn atime(&self) -> Duration {
-        self.desc.atime
+        self.inner.read().desc.atime
     }
 
     pub(super) fn mtime(&self) -> Duration {
-        self.desc.mtime
+        self.inner.read().desc.mtime
     }
 
     pub(super) fn ctime(&self) -> Duration {
-        self.desc.ctime
+        self.inner.read().desc.ctime
+    }
+
+    pub(super) fn link_count(&self) -> u16 {
+        self.inner.read().desc.link_count
     }
 
     pub(super) fn extension(&self) -> &Extension {
@@ -179,16 +197,151 @@ impl Inode {
             .ok_or_else(|| Error::with_message(Errno::EIO, "filesystem already dropped"))
     }
 
+    /// Returns whether the mount this inode belongs to may be changed.
+    fn is_writable(&self) -> bool {
+        self.fs().is_ok_and(|fs| fs.is_writable())
+    }
+
+    /// Sets the file permission bits.
+    pub(super) fn set_mode(&self, mode: InodeMode) -> Result<()> {
+        self.fs()?.check_writable()?;
+        let mut inner = self.inner.write();
+        inner.desc.perm = FilePerm(mode.bits() & 0o7777);
+        inner.desc.ctime = now();
+        Ok(())
+    }
+
+    /// Sets the owning user.
+    pub(super) fn set_uid(&self, uid: u32) -> Result<()> {
+        self.fs()?.check_writable()?;
+        let mut inner = self.inner.write();
+        inner.desc.uid = uid;
+        inner.desc.ctime = now();
+        Ok(())
+    }
+
+    /// Sets the owning group.
+    pub(super) fn set_gid(&self, gid: u32) -> Result<()> {
+        self.fs()?.check_writable()?;
+        let mut inner = self.inner.write();
+        inner.desc.gid = gid;
+        inner.desc.ctime = now();
+        Ok(())
+    }
+
+    /// Records a new access time, unless the mount forbids changing anything.
+    ///
+    /// The VFS declares these setters infallible, so a read-only mount can
+    /// only ignore them.
+    pub(super) fn set_atime(&self, time: Duration) {
+        if self.is_writable() {
+            self.inner.write().desc.atime = time;
+        }
+    }
+
+    pub(super) fn set_mtime(&self, time: Duration) {
+        if self.is_writable() {
+            self.inner.write().desc.mtime = time;
+        }
+    }
+
+    pub(super) fn set_ctime(&self, time: Duration) {
+        if self.is_writable() {
+            self.inner.write().desc.ctime = time;
+        }
+    }
+
+    /// Adds `delta` to the number of names this file has.
+    pub(super) fn adjust_link_count(&self, delta: i32) {
+        let mut inner = self.inner.write();
+        let count = inner.desc.link_count as i32 + delta;
+        inner.desc.link_count = count.clamp(0, u16::MAX as i32) as u16;
+        inner.desc.ctime = now();
+    }
+
+    /// Writes a symbolic link's target, inside the inode where it fits.
+    pub(super) fn write_symlink_target(&self, target: &str) -> Result<()> {
+        let fs = self.fs()?;
+        let mut inner = self.inner.write();
+
+        if target.len() < EXTENT_ROOT_LEN {
+            let mut block = [0u8; EXTENT_ROOT_LEN];
+            block[..target.len()].copy_from_slice(target.as_bytes());
+            inner.desc.block = block;
+            inner.desc.size = target.len() as u64;
+            inner.payload = InodePayload::FastSymlink { target: block };
+            return Ok(());
+        }
+
+        // A longer target needs a block, which means the inode needs the
+        // extent tree that a data-backed payload carries.
+        inner.desc.flags |= FileFlags::EXTENTS;
+        inner.payload = InodePayload::new_data_backed(
+            &inner.desc,
+            fs.super_block().blocks_count,
+            self.fs.clone(),
+        )?;
+        inner.resize(&fs, target.len())?;
+        inner
+            .page_cache_of_data()?
+            .write_bytes(0, target.as_bytes())?;
+        Ok(())
+    }
+
+    /// Writes the inode record back if anything changed it.
+    pub(super) fn sync_metadata(&self) -> Result<()> {
+        let mut inner = self.inner.write();
+        // Writeback can have extended the extent tree since the last sync, and
+        // the inode is what records where that tree now stands.
+        inner.collect_block_changes();
+        if !inner.desc.is_dirty() {
+            return Ok(());
+        }
+
+        self.fs()?.write_back_inode(self.ino, &inner.desc)?;
+        inner.desc.clear_dirty();
+        Ok(())
+    }
+
+    /// Writes back cached data pages and then the inode record.
+    pub(super) fn sync_all(&self) -> Result<()> {
+        {
+            let inner = self.inner.read();
+            if let Some(page_cache) = inner.payload.page_cache() {
+                page_cache.flush_range(0..page_cache.size())?;
+            }
+        }
+        self.sync_metadata()
+    }
+
+    /// Records the device number of a character or block special file.
+    pub(super) fn set_device_id(&self, device_id: u64) -> Result<()> {
+        if self.type_ != InodeType::CharDevice && self.type_ != InodeType::BlockDevice {
+            return_errno!(Errno::EINVAL);
+        }
+
+        let mut inner = self.inner.write();
+        inner.desc.block = encode_device_id(device_id);
+        inner.payload = InodePayload::Device { device_id };
+        inner.desc.ctime = now();
+        Ok(())
+    }
+
     /// Returns the encoded device ID of a character or block special file.
     pub(super) fn device_id(&self) -> u64 {
-        match &self.payload {
+        match &self.inner.read().payload {
             InodePayload::Device { device_id } => *device_id,
             _ => 0,
         }
     }
 
     pub(super) fn page_cache(&self) -> Option<Arc<Vmo>> {
-        self.payload.page_cache().map(PageCache::as_vmo).cloned()
+        self.inner
+            .read()
+            .payload
+            .page_cache()
+            .map(PageCache::as_vmo)
+            .cloned()
     }
 
     pub(super) fn metadata(&self) -> Metadata {
@@ -196,57 +349,59 @@ impl Inode {
             Some(fs) => fs.block_device().id(),
             None => DeviceId::null(),
         };
-        let self_dev_id = match self.desc.type_ {
+        let self_dev_id = match self.type_ {
             InodeType::CharDevice | InodeType::BlockDevice => {
                 DeviceId::from_encoded_u64(self.device_id())
             }
             _ => None,
         };
 
+        let inner = self.inner.read();
         Metadata {
             ino: self.ino as u64,
-            size: self.file_size(),
+            size: inner.desc.size as usize,
             optimal_block_size: BLOCK_SIZE,
-            nr_sectors_allocated: self.desc.sector_count as usize,
-            last_access_at: self.desc.atime,
-            last_modify_at: self.desc.mtime,
-            last_meta_change_at: self.desc.ctime,
-            type_: self.desc.type_,
-            mode: self.mode(),
-            nr_hard_links: self.desc.link_count as usize,
-            uid: Uid::new(self.desc.uid),
-            gid: Gid::new(self.desc.gid),
+            nr_sectors_allocated: inner.desc.sector_count as usize,
+            last_access_at: inner.desc.atime,
+            last_modify_at: inner.desc.mtime,
+            last_meta_change_at: inner.desc.ctime,
+            type_: self.type_,
+            mode: InodeMode::from_bits_truncate(inner.desc.perm.bits()),
+            nr_hard_links: inner.desc.link_count as usize,
+            uid: Uid::new(inner.desc.uid),
+            gid: Gid::new(inner.desc.gid),
             container_dev_id,
             self_dev_id,
             // Unlike ext2, ext4 records a creation time, when the inode is
             // large enough to hold one.
-            birth_at: self.desc.crtime,
+            birth_at: inner.desc.crtime,
         }
     }
 
     /// Reads file data at `offset` through the page cache.
     pub(super) fn read_at(&self, offset: usize, writer: &mut VmWriter) -> Result<usize> {
-        if self.desc.type_ == InodeType::Dir {
+        if self.type_ == InodeType::Dir {
             return_errno!(Errno::EISDIR);
         }
         if writer.avail() == 0 {
             return Ok(0);
         }
 
-        let file_size = self.file_size();
+        let inner = self.inner.read();
+        let file_size = inner.desc.size as usize;
         if offset >= file_size {
             return Ok(0);
         }
 
         let read_len = writer.avail().min(file_size - offset);
         writer.limit(read_len);
-        self.page_cache_of_data()?.read(offset, writer)?;
+        inner.page_cache_of_data()?.read(offset, writer)?;
         Ok(read_len)
     }
 
     /// Reads file data at `offset` straight from the device.
     pub(super) fn read_direct_at(&self, offset: usize, writer: &mut VmWriter) -> Result<usize> {
-        if self.desc.type_ == InodeType::Dir {
+        if self.type_ == InodeType::Dir {
             return_errno!(Errno::EISDIR);
         }
         if !offset.is_multiple_of(BLOCK_SIZE) || !writer.avail().is_multiple_of(BLOCK_SIZE) {
@@ -255,7 +410,8 @@ impl Inode {
             return_errno_with_message!(Errno::EINVAL, "not block-aligned");
         }
 
-        let file_size = self.file_size();
+        let inner = self.inner.read();
+        let file_size = inner.desc.size as usize;
         if offset >= file_size {
             return Ok(0);
         }
@@ -268,7 +424,7 @@ impl Inode {
         writer.limit(read_len);
 
         let fs = self.fs()?;
-        let block_manager = self.payload.block_manager()?;
+        let block_manager = inner.payload.block_manager()?;
         let iblock_range =
             (offset / BLOCK_SIZE) as Iblock..(offset + read_len).div_ceil(BLOCK_SIZE) as Iblock;
         let mut io_ranges = block_manager.iter_io_ranges(&fs, iblock_range);
@@ -293,14 +449,43 @@ impl Inode {
         Ok(read_len)
     }
 
-    /// Reads the target of a symbolic link.
-    pub(super) fn read_link(&self) -> Result<String> {
-        if self.desc.type_ != InodeType::SymLink {
+    /// Writes file data at `offset` through the page cache.
+    pub(super) fn write_at(&self, offset: usize, reader: &mut VmReader) -> Result<usize> {
+        if self.type_ == InodeType::Dir {
+            return_errno!(Errno::EISDIR);
+        }
+        if reader.remain() == 0 {
+            return Ok(0);
+        }
+
+        let fs = self.fs()?;
+        fs.check_writable()?;
+        self.inner.write().write_at(&fs, offset, reader)
+    }
+
+    /// Truncates or extends the file to `new_size` bytes.
+    pub(super) fn resize(&self, new_size: usize) -> Result<()> {
+        if self.type_ == InodeType::Dir {
+            return_errno!(Errno::EISDIR);
+        }
+        if self.type_ != InodeType::File && self.type_ != InodeType::SymLink {
             return_errno!(Errno::EINVAL);
         }
 
-        let len = self.file_size();
-        let bytes = match &self.payload {
+        let fs = self.fs()?;
+        fs.check_writable()?;
+        self.inner.write().resize(&fs, new_size)
+    }
+
+    /// Reads the target of a symbolic link.
+    pub(super) fn read_link(&self) -> Result<String> {
+        if self.type_ != InodeType::SymLink {
+            return_errno!(Errno::EINVAL);
+        }
+
+        let inner = self.inner.read();
+        let len = inner.desc.size as usize;
+        let bytes = match &inner.payload {
             InodePayload::FastSymlink { target } => target[..len].to_vec(),
             InodePayload::DataBacked { page_cache, .. } => {
                 let mut bytes = vec![0u8; len];
@@ -313,12 +498,154 @@ impl Inode {
         String::from_utf8(bytes)
             .map_err(|_| Error::with_message(Errno::EUCLEAN, "symlink target is not UTF-8"))
     }
+}
+
+impl Drop for Inode {
+    fn drop(&mut self) {
+        // A file whose last name is gone is only freed once nothing holds it
+        // open, which is what lets a program keep reading what it deleted.
+        if self.inner.read().desc.link_count == 0 {
+            if let Err(err) = self.reclaim() {
+                error!("failed to free deleted inode {}: {:?}", self.ino, err);
+            }
+            return;
+        }
+
+        // Nothing else holds this inode, so a change that was never synced
+        // would be lost here rather than merely delayed.
+        if let Err(err) = self.sync_metadata() {
+            error!("failed to write back inode {}: {:?}", self.ino, err);
+        }
+    }
+}
+
+impl Inode {
+    /// Gives a deleted file's blocks and inode number back to the volume.
+    fn reclaim(&self) -> Result<()> {
+        let fs = self.fs()?;
+        if !fs.is_writable() {
+            return Ok(());
+        }
+
+        {
+            let mut inner = self.inner.write();
+            if let Ok(manager) = inner.payload.block_manager() {
+                manager.clone().truncate(&fs, 0)?;
+            }
+            inner.desc.size = 0;
+            inner.desc.dtime = now();
+            inner.collect_block_changes();
+        }
+
+        self.sync_metadata()?;
+        fs.free_ino(self.ino, self.type_ == InodeType::Dir)
+    }
+}
+
+impl InodeInner {
+    /// Writes `reader` into the file at `offset`, growing it if need be.
+    fn write_at(&mut self, fs: &Ext4, offset: usize, reader: &mut VmReader) -> Result<usize> {
+        let write_len = reader.remain();
+        let end = offset
+            .checked_add(write_len)
+            .ok_or_else(|| Error::with_message(Errno::EINVAL, "write range overflow"))?;
+        let old_size = self.desc.size as usize;
+
+        if end > old_size {
+            self.resize_page_cache(end, old_size)?;
+        }
+
+        // Blocks are reserved before any data reaches the cache, so a volume
+        // that is full leaves the file as it was rather than holding pages
+        // that can never be written back.
+        let manager = self.payload.block_manager()?.clone();
+        let block_range = (offset / BLOCK_SIZE) as Iblock..end.div_ceil(BLOCK_SIZE) as Iblock;
+        if let Err(err) = manager.allocate_range(fs, block_range) {
+            self.collect_block_changes();
+            if end > old_size {
+                let _ = self.resize_page_cache(old_size, end);
+            }
+            return Err(err);
+        }
+
+        self.page_cache_of_data()?.write(offset, reader)?;
+
+        if end > old_size {
+            self.desc.size = end as u64;
+        }
+        self.set_modified(now());
+        self.collect_block_changes();
+        Ok(write_len)
+    }
+
+    /// Changes the file's length, freeing what a shorter one no longer needs.
+    fn resize(&mut self, fs: &Ext4, new_size: usize) -> Result<()> {
+        let old_size = self.desc.size as usize;
+        if new_size == old_size {
+            return Ok(());
+        }
+
+        self.resize_page_cache(new_size, old_size)?;
+        if new_size < old_size {
+            let manager = self.payload.block_manager()?.clone();
+            manager.truncate(fs, new_size.div_ceil(BLOCK_SIZE) as Iblock)?;
+        }
+
+        self.desc.size = new_size as u64;
+        self.set_modified(now());
+        self.collect_block_changes();
+        Ok(())
+    }
+
+    fn resize_page_cache(&mut self, new_size: usize, old_size: usize) -> Result<()> {
+        let InodePayload::DataBacked {
+            page_cache,
+            block_manager,
+        } = &mut self.payload
+        else {
+            return_errno_with_message!(Errno::EINVAL, "inode has no data page cache");
+        };
+
+        page_cache.resize(new_size, old_size)?;
+        // The backend refuses I/O past what it believes the file holds, so it
+        // has to learn the new length before anything reaches it.
+        block_manager.set_npages(new_size.div_ceil(PAGE_SIZE));
+        Ok(())
+    }
+
+    fn set_modified(&mut self, time: Duration) {
+        self.desc.mtime = time;
+        self.desc.ctime = time;
+    }
+
+    /// Folds what the block manager changed into the descriptor.
+    ///
+    /// The tree is rooted in the inode's own bytes, and writeback can extend
+    /// it with no inode at hand, so the inode collects the change rather than
+    /// being told about it.
+    fn collect_block_changes(&mut self) {
+        let Ok(manager) = self.payload.block_manager() else {
+            return;
+        };
+        if !manager.is_dirty() {
+            return;
+        }
+
+        let (root, sectors) = manager.clone().take_changes();
+        self.desc.block = root;
+        self.desc.sector_count = self.desc.sector_count.saturating_add_signed(sectors);
+    }
 
     fn page_cache_of_data(&self) -> Result<&PageCache> {
         self.payload
             .page_cache()
             .ok_or_else(|| Error::with_message(Errno::EINVAL, "inode has no data page cache"))
     }
+}
+
+/// Returns the current time, as the inode timestamps record it.
+pub(super) fn now() -> Duration {
+    crate::time::clocks::RealTimeCoarseClock::get().read_time()
 }
 
 /// Decoded in-memory mirror of an on-disk inode's metadata fields.
@@ -334,6 +661,8 @@ pub(super) struct InodeDesc {
     mtime: Duration,
     crtime: Option<Duration>,
     link_count: u16,
+    /// When the file was deleted, which is zero for one that still exists.
+    dtime: Duration,
     /// Allocated storage in 512-byte sectors, as `stat` reports it.
     sector_count: u64,
     flags: FileFlags,
@@ -342,6 +671,36 @@ pub(super) struct InodeDesc {
 }
 
 impl InodeDesc {
+    /// Builds the descriptor of a file that is about to exist.
+    pub(super) fn new(
+        type_: InodeType,
+        mode: InodeMode,
+        uid: u32,
+        gid: u32,
+        link_count: u16,
+        now: Duration,
+    ) -> Self {
+        Self {
+            type_,
+            perm: FilePerm(mode.bits() & 0o7777),
+            uid,
+            gid,
+            size: 0,
+            atime: now,
+            ctime: now,
+            mtime: now,
+            crtime: Some(now),
+            link_count,
+            dtime: Duration::ZERO,
+            sector_count: 0,
+            // Every file this driver creates is mapped by extents, which is
+            // the only layout it writes.
+            flags: FileFlags::EXTENTS,
+            file_acl: 0,
+            block: ExtentTree::empty(0).root_bytes(),
+        }
+    }
+
     /// Decodes an on-disk inode.
     ///
     /// `inode_size` decides how much of the record exists: the fields past the
@@ -390,6 +749,7 @@ impl InodeDesc {
                 .crtime
                 .map(|secs| decode_time(secs, extra.crtime_extra)),
             link_count: raw.link_count,
+            dtime: Duration::from_secs(raw.dtime as u64),
             sector_count: decode_sector_count(raw, flags, ro_compat),
             flags,
             file_acl: (raw.file_acl_lo as u64) | ((raw.file_acl_high as u64) << 32),
@@ -410,6 +770,109 @@ impl InodeDesc {
 
         self.sector_count == xattr_sectors && self.size < EXTENT_ROOT_LEN as u64
     }
+
+    /// Overwrites the fields this driver owns in an on-disk inode record.
+    ///
+    /// `raw` must be the record as it currently stands on the device. Writing
+    /// into it rather than building one from scratch is what preserves the
+    /// bytes this driver does not understand: the inline extended attributes
+    /// past the classic area, the checksum halves, and the version counters.
+    ///
+    /// `inode_size` decides which of the fields ext4 added exist at all; a
+    /// nanosecond field that the inode is too small to hold is left alone, and
+    /// the timestamp keeps whole-second resolution.
+    pub(super) fn write_into(&self, raw: &mut RawInode, inode_size: usize, ro_compat: u32) {
+        raw.mode = (self.type_ as u16) | (self.perm.bits() & 0o7777);
+        raw.uid = self.uid as u16;
+        raw.uid_high = (self.uid >> 16) as u16;
+        raw.gid = self.gid as u16;
+        raw.gid_high = (self.gid >> 16) as u16;
+        raw.link_count = self.link_count;
+        raw.dtime = self.dtime.as_secs() as u32;
+        raw.flags = self.flags.bits();
+        raw.file_acl_lo = self.file_acl as u32;
+        raw.file_acl_high = (self.file_acl >> 32) as u16;
+        raw.block = self.block;
+
+        raw.size_lo = self.size as u32;
+        // The upper half is the historical `i_dir_acl`, and only a regular
+        // file is allowed to use it as a size.
+        if self.type_ == InodeType::File {
+            raw.size_high = (self.size >> 32) as u32;
+        }
+
+        encode_sector_count(raw, self.sector_count, self.flags, ro_compat);
+
+        let present = ExtraFields::of(raw, inode_size);
+        let write_time = |secs: &mut u32, extra: &mut u32, was_present: bool, time: Duration| {
+            let (encoded_secs, encoded_extra) = encode_time(time);
+            *secs = encoded_secs;
+            if was_present {
+                *extra = encoded_extra;
+            }
+        };
+        write_time(
+            &mut raw.atime,
+            &mut raw.atime_extra,
+            present.atime_extra.is_some(),
+            self.atime,
+        );
+        write_time(
+            &mut raw.mtime,
+            &mut raw.mtime_extra,
+            present.mtime_extra.is_some(),
+            self.mtime,
+        );
+        write_time(
+            &mut raw.ctime,
+            &mut raw.ctime_extra,
+            present.ctime_extra.is_some(),
+            self.ctime,
+        );
+        if let Some(crtime) = self.crtime
+            && present.crtime.is_some()
+        {
+            write_time(
+                &mut raw.crtime,
+                &mut raw.crtime_extra,
+                present.crtime_extra.is_some(),
+                crtime,
+            );
+        }
+    }
+}
+
+/// Encodes a timestamp into its seconds field and its extra field.
+///
+/// The inverse of [`decode_time`]: the extra field carries nanoseconds in its
+/// upper 30 bits and the two seconds bits past 2038 in its lower two.
+fn encode_time(time: Duration) -> (u32, u32) {
+    let secs = time.as_secs();
+    let epoch_hi = ((secs >> 32) & 0x3) as u32;
+
+    (secs as u32, (time.subsec_nanos() << 2) | epoch_hi)
+}
+
+/// Writes a 512-byte sector count back into `i_blocks`.
+///
+/// The inverse of [`decode_sector_count`]. A count that does not fit the
+/// 48-bit field is recorded in filesystem blocks instead, which is what the
+/// `HUGE_FILE` inode flag means.
+fn encode_sector_count(raw: &mut RawInode, sectors: u64, flags: FileFlags, ro_compat: u32) {
+    use super::features::FeatureRoCompat;
+
+    if (ro_compat & FeatureRoCompat::HUGE_FILE.bits()) == 0 {
+        raw.blocks_lo = sectors as u32;
+        return;
+    }
+
+    let count = if flags.contains(FileFlags::HUGE_FILE) {
+        sectors / (BLOCK_SIZE / SECTOR_SIZE) as u64
+    } else {
+        sectors
+    };
+    raw.blocks_lo = count as u32;
+    raw.blocks_high = (count >> 32) as u16;
 }
 
 /// Decodes an ext4 timestamp.
@@ -515,7 +978,11 @@ impl InodePayload {
         }
     }
 
-    fn new_data_backed(desc: &InodeDesc, volume_blocks: u64, fs: Weak<Ext4>) -> Result<Self> {
+    pub(super) fn new_data_backed(
+        desc: &InodeDesc,
+        volume_blocks: u64,
+        fs: Weak<Ext4>,
+    ) -> Result<Self> {
         // Without the extent flag the file uses the ext2 block-pointer layout,
         // which ext4 still permits and this driver does not read.
         if !desc.flags.contains(FileFlags::EXTENTS) {
@@ -557,6 +1024,23 @@ impl InodePayload {
             )),
         }
     }
+}
+
+/// Encodes a device number into the `i_block` area a special file uses.
+///
+/// The historical form holds eight bits of each number in the first word; a
+/// number too large for it goes in the second, spread out.
+fn encode_device_id(device_id: u64) -> [u8; EXTENT_ROOT_LEN] {
+    let (major, minor) = decode_device_numbers(device_id);
+
+    let mut block = [0u8; EXTENT_ROOT_LEN];
+    if major < 256 && minor < 256 {
+        block[0..4].copy_from_slice(&((major << 8) | minor).to_le_bytes());
+    } else {
+        let encoded = (minor & 0xff) | ((major & 0xfff) << 8) | ((minor >> 8) << 20);
+        block[4..8].copy_from_slice(&encoded.to_le_bytes());
+    }
+    block
 }
 
 /// Decodes the device number a special file stores in its `i_block` area.
@@ -1028,6 +1512,184 @@ mod test {
 
         assert_eq!(metadata.last_access_at.subsec_nanos(), 0);
         assert!(metadata.last_access_at.as_secs() > 0);
+    }
+
+    /// Writes within a file that already has the blocks must reach the device
+    /// through the page cache and come back.
+    #[ktest]
+    fn a_write_inside_an_existing_file_reads_back() {
+        let ext4 = mount();
+        let inode = ext4.read_inode(TWO_EXTENT_INO).expect("should read");
+
+        let payload = [0x5au8; 8];
+        let mut reader = VmReader::from(payload.as_slice()).to_fallible();
+        let written = inode.write_at(16, &mut reader).expect("should write");
+
+        assert_eq!(written, payload.len());
+        let mut buf = [0u8; 8];
+        let mut writer = VmWriter::from(buf.as_mut_slice()).to_fallible();
+        inode.read_at(16, &mut writer).expect("should read");
+        assert_eq!(buf, payload);
+    }
+
+    /// A write past the end grows the file, which needs a block that nothing
+    /// had allocated and an extent that nothing had recorded.
+    #[ktest]
+    fn a_write_past_the_end_grows_the_file() {
+        let ext4 = mount();
+        let inode = ext4.read_inode(HELLO_INO).expect("should read");
+        let old_sectors = inode.metadata().nr_sectors_allocated;
+
+        let payload = [0x77u8; 32];
+        let mut reader = VmReader::from(payload.as_slice()).to_fallible();
+        inode
+            .write_at(2 * BLOCK_SIZE, &mut reader)
+            .expect("should write");
+
+        assert_eq!(inode.file_size(), 2 * BLOCK_SIZE + payload.len());
+        assert!(
+            inode.metadata().nr_sectors_allocated > old_sectors,
+            "growing a file must account for the blocks it took"
+        );
+
+        let mut buf = [0u8; 32];
+        let mut writer = VmWriter::from(buf.as_mut_slice()).to_fallible();
+        inode
+            .read_at(2 * BLOCK_SIZE, &mut writer)
+            .expect("should read");
+        assert_eq!(buf, payload);
+    }
+
+    /// The bytes between the old end and a write past it read as zeros, as a
+    /// hole does, rather than as whatever the block held before.
+    #[ktest]
+    fn the_gap_a_growing_write_leaves_reads_as_zeros() {
+        let ext4 = mount();
+        let inode = ext4.read_inode(HELLO_INO).expect("should read");
+
+        let payload = [0x11u8; 4];
+        let mut reader = VmReader::from(payload.as_slice()).to_fallible();
+        inode.write_at(64, &mut reader).expect("should write");
+
+        let mut buf = [0xffu8; 16];
+        let mut writer = VmWriter::from(buf.as_mut_slice()).to_fallible();
+        inode.read_at(32, &mut writer).expect("should read");
+        assert!(buf.iter().all(|&byte| byte == 0));
+    }
+
+    /// A file written in one go should cost one extent, which is the whole
+    /// point of a format that records runs rather than blocks.
+    #[ktest]
+    fn a_file_written_in_one_go_costs_one_extent() {
+        let ext4 = mount();
+        let inode = ext4.read_inode(HELLO_INO).expect("should read");
+        // Starting from nothing, so that the run is chosen rather than
+        // constrained by what the file already held.
+        inode.resize(0).expect("should truncate");
+
+        let payload = vec![0x2bu8; 4 * BLOCK_SIZE];
+        let mut reader = VmReader::from(payload.as_slice()).to_fallible();
+        inode.write_at(0, &mut reader).expect("should write");
+
+        assert_eq!(inode.file_size(), 4 * BLOCK_SIZE);
+        let inner = inode.inner.read();
+        let manager = inner
+            .payload
+            .block_manager()
+            .expect("a regular file has a block manager");
+        let fs = inode.fs().expect("the filesystem is alive");
+        // One run covering the whole file is what a single extent looks like
+        // from the outside.
+        let mut ranges = manager.iter_io_ranges(&fs, 0..4);
+        let first = ranges.next().expect("should map").expect("one run");
+        assert!(
+            matches!(first, IoRange::Mapped(ref range) if range.end - range.start == 4),
+            "a sequential write should produce one extent, got {:?}",
+            first
+        );
+    }
+
+    /// Shortening a file must give its blocks back, or a volume leaks space
+    /// every time a file is rewritten.
+    #[ktest]
+    fn truncating_a_file_returns_its_blocks() {
+        let ext4 = mount();
+        let inode = ext4.read_inode(HELLO_INO).expect("should read");
+
+        let block = vec![0x3cu8; BLOCK_SIZE];
+        for index in 0..4 {
+            let mut reader = VmReader::from(block.as_slice()).to_fallible();
+            inode
+                .write_at(index * BLOCK_SIZE, &mut reader)
+                .expect("should write");
+        }
+        let grown_sectors = inode.metadata().nr_sectors_allocated;
+        let free_before = ext4.free_blocks_count();
+
+        inode.resize(0).expect("should truncate");
+
+        assert_eq!(inode.file_size(), 0);
+        assert!(inode.metadata().nr_sectors_allocated < grown_sectors);
+        assert!(
+            ext4.free_blocks_count() > free_before,
+            "truncating must return blocks to the volume"
+        );
+    }
+
+    /// What a write changed has to survive being written back and read from
+    /// the device again, which is the only thing that proves it was recorded.
+    #[ktest]
+    fn a_written_file_survives_being_read_from_the_device_again() {
+        let volume = Ext4VolumeBuilder::new().build();
+        let fs = fs::open(volume.disk.clone(), FsFlags::empty(), None).expect("should mount");
+        let ext4 = fs
+            .downcast_ref::<Ext4>()
+            .expect("should be an ext4 volume")
+            .root_inode()
+            .expect("root should be readable")
+            .fs()
+            .expect("the filesystem should outlive its root");
+
+        let payload = vec![0x6du8; BLOCK_SIZE + 7];
+        {
+            let inode = ext4.read_inode(HELLO_INO).expect("should read");
+            let mut reader = VmReader::from(payload.as_slice()).to_fallible();
+            inode.write_at(0, &mut reader).expect("should write");
+            inode.sync_all().expect("should write back");
+        }
+
+        // Mounting the same device afresh reads the inode back off it.
+        let reopened =
+            fs::open(volume.disk.clone(), FsFlags::empty(), None).expect("should mount again");
+        let ext4 = reopened
+            .downcast_ref::<Ext4>()
+            .expect("should be an ext4 volume");
+        let inode = ext4.read_inode(HELLO_INO).expect("should read");
+
+        assert_eq!(inode.file_size(), payload.len());
+        assert_eq!(read_whole(&inode), payload);
+    }
+
+    /// A volume with no room left must say so rather than losing the write.
+    #[ktest]
+    fn a_write_that_does_not_fit_reports_enospc() {
+        let ext4 = mount();
+        let inode = ext4.read_inode(HELLO_INO).expect("should read");
+
+        // The fixture volume is 256 blocks, so this cannot fit.
+        let block = vec![0u8; BLOCK_SIZE];
+        let mut filled = 0;
+        let outcome = loop {
+            let mut reader = VmReader::from(block.as_slice()).to_fallible();
+            match inode.write_at(filled * BLOCK_SIZE, &mut reader) {
+                Ok(_) => filled += 1,
+                Err(err) => break err,
+            }
+            assert!(filled < 512, "the volume should have run out by now");
+        };
+
+        assert_eq!(outcome.error(), Errno::ENOSPC);
+        assert!(filled > 0, "some of the writes should have fitted");
     }
 
     /// `i_crtime` lives past the classic 128-byte inode, so a volume with

@@ -17,12 +17,18 @@
 //!
 //! # What this iteration covers
 //!
-//! Mounting and reading: extent-mapped files, linear and hash-indexed
-//! directories, symbolic links, and special files. Volumes mount read-only,
-//! and every operation that would change one reports `EROFS`. Journalling,
-//! metadata checksum verification, extended attributes, inline data and
-//! encryption are not implemented; `features` describes which of them refuse a
-//! volume and which only force it read-only.
+//! Reading: extent-mapped files, linear and hash-indexed directories,
+//! symbolic links, and special files.
+//!
+//! Writing: creating, removing and renaming nothing yet, but writing to and
+//! truncating files, creating and removing files, directories, symbolic links,
+//! hard links and special files. A volume whose features this driver cannot
+//! maintain mounts read-only instead, which `features` describes.
+//!
+//! Not implemented: journalling, metadata checksums, extended attributes,
+//! inline data, encryption, renaming, and changing a hash-indexed directory.
+//! The extent tree this driver builds reaches one level above its leaves, so
+//! a file needing more than 1360 extents is refused rather than mis-written.
 //!
 //! # On-disk layout
 //!

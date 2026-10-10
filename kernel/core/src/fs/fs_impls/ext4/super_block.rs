@@ -29,6 +29,12 @@ pub(super) const MAGIC_NUM: u16 = 0xef53;
 /// The main superblock is located at byte 1024 from the beginning of the device.
 pub(super) const SUPER_BLOCK_OFFSET: usize = 1024;
 
+/// `EXT4_VALID_FS`: the volume was unmounted cleanly.
+///
+/// A read-write mount clears it and restores it on unmount, so a crash leaves
+/// the volume marked dirty and `e2fsck` runs over it on the next boot.
+pub(super) const STATE_VALID_FS: u16 = 0x0001;
+
 const SUPER_BLOCK_SIZE: usize = 1024;
 
 /// The `log_block_size` shift that yields a 4096-byte block.
@@ -53,6 +59,8 @@ pub(super) struct SuperBlock {
     pub first_data_block: u32,
     pub blocks_per_group: u32,
     pub inodes_per_group: u32,
+    /// First inode a file may use; everything below is reserved by the format.
+    pub first_ino: u32,
     pub feature_compat: u32,
     pub feature_incompat: u32,
     pub feature_ro_compat: u32,
@@ -175,6 +183,7 @@ impl TryFrom<RawSuperBlock> for SuperBlock {
             first_data_block: sb.first_data_block,
             blocks_per_group: sb.blocks_per_group,
             inodes_per_group: sb.inodes_per_group,
+            first_ino: sb.first_ino,
             feature_compat: sb.feature_compat,
             feature_incompat: sb.feature_incompat,
             feature_ro_compat: sb.feature_ro_compat,

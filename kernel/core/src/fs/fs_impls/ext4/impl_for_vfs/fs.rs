@@ -22,8 +22,9 @@ impl FileSystem for Ext4 {
     }
 
     fn sync(&self) -> Result<()> {
-        // A read-only mount holds nothing that needs writing back, but the
-        // device may still hold writes made before it was mounted.
+        if self.is_writable() {
+            self.sync_all()?;
+        }
         if self.block_device().sync()? != BioStatus::Complete {
             return_errno_with_message!(Errno::EIO, "failed to flush block device");
         }
@@ -62,8 +63,11 @@ impl FileSystem for Ext4 {
     }
 
     fn set_fs_flags(&self, flags: FsFlags, _data: Option<&str>, _ctx: &Context) -> Result<()> {
-        if !flags.contains(FsFlags::RDONLY) {
-            return_errno_with_message!(Errno::EROFS, "ext4 writing is not implemented yet");
+        // Going from read-only to read-write would need the checks the mount
+        // makes, and remounting read-only would need everything cached to be
+        // written back first. Neither is implemented.
+        if flags.contains(FsFlags::RDONLY) != self.flags().contains(FsFlags::RDONLY) {
+            return_errno_with_message!(Errno::EOPNOTSUPP, "ext4 cannot be remounted");
         }
         Ok(())
     }
@@ -80,15 +84,19 @@ mod test {
     use super::*;
     use crate::fs::fs_impls::ext4::{
         fs as ext4_fs,
-        test_utils::{
-            Ext4VolumeBuilder, FREE_BLOCKS, FREE_INODES, RESERVED_BLOCKS, TOTAL_BLOCKS,
-            TOTAL_INODES,
-        },
+        test_utils::{Ext4Volume, Ext4VolumeBuilder, RESERVED_BLOCKS, TOTAL_BLOCKS, TOTAL_INODES},
     };
 
-    fn mount() -> Arc<dyn FileSystem> {
+    /// Mounts a fixture volume, keeping it so that a test can compare what
+    /// `statfs` reports against what the fixture put there.
+    fn mount_volume() -> (Ext4Volume, Arc<dyn FileSystem>) {
         let volume = Ext4VolumeBuilder::new().build();
-        ext4_fs::open(volume.disk.clone(), FsFlags::empty(), None).expect("should mount")
+        let fs = ext4_fs::open(volume.disk.clone(), FsFlags::empty(), None).expect("should mount");
+        (volume, fs)
+    }
+
+    fn mount() -> Arc<dyn FileSystem> {
+        mount_volume().1
     }
 
     #[ktest]
@@ -101,24 +109,26 @@ mod test {
     /// failure.
     #[ktest]
     fn statfs_reports_the_counts_the_superblock_holds() {
-        let sb = mount().sb();
+        let (volume, fs) = mount_volume();
+        let sb = fs.sb();
 
         assert_eq!(sb.magic, MAGIC_NUM as u64);
         assert_eq!(sb.bsize, BLOCK_SIZE);
         assert_eq!(sb.frsize, BLOCK_SIZE);
         assert_eq!(sb.blocks, TOTAL_BLOCKS as usize);
-        assert_eq!(sb.bfree, FREE_BLOCKS as usize);
+        assert_eq!(sb.bfree, volume.free_blocks as usize);
         assert_eq!(sb.files, TOTAL_INODES as usize);
-        assert_eq!(sb.ffree, FREE_INODES as usize);
+        assert_eq!(sb.ffree, volume.free_inodes as usize);
         assert_eq!(sb.namelen, NAME_MAX);
     }
 
     /// The blocks an unprivileged writer may use exclude the reserved ones.
     #[ktest]
     fn statfs_withholds_the_reserved_blocks_from_bavail() {
-        let sb = mount().sb();
+        let (volume, fs) = mount_volume();
+        let sb = fs.sb();
 
-        assert_eq!(sb.bavail, (FREE_BLOCKS - RESERVED_BLOCKS) as usize);
+        assert_eq!(sb.bavail, (volume.free_blocks - RESERVED_BLOCKS) as usize);
     }
 
     #[ktest]
@@ -130,12 +140,13 @@ mod test {
     }
 
     #[ktest]
-    fn syncing_a_read_only_mount_succeeds() {
-        mount().sync().expect("there is nothing to write back");
+    fn syncing_a_mount_succeeds() {
+        mount().sync().expect("should write back");
     }
 
+    /// A volume whose features this driver can maintain mounts writable.
     #[ktest]
-    fn a_mount_reports_itself_read_only() {
-        assert!(mount().flags().contains(FsFlags::RDONLY));
+    fn a_reduced_feature_volume_mounts_writable() {
+        assert!(!mount().flags().contains(FsFlags::RDONLY));
     }
 }

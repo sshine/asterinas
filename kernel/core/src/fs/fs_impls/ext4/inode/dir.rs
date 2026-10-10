@@ -36,7 +36,7 @@
 
 use ostd::const_assert;
 
-use super::Inode;
+use super::{FileFlags, Inode, InodeInner, now};
 use crate::fs::{fs_impls::ext4::prelude::*, utils::NAME_MAX};
 
 impl Inode {
@@ -59,13 +59,14 @@ impl Inode {
             return_errno!(Errno::ENOTDIR);
         }
 
-        let size = self.file_size();
+        let inner = self.inner.read();
+        let size = inner.desc.size as usize;
         let min_rec_len = DirEntryHeader::min_rec_len(1) as usize;
         if size < min_rec_len || offset > size - min_rec_len {
             return Ok(0);
         }
 
-        let page_cache = self.page_cache_of_data()?;
+        let page_cache = inner.page_cache_of_data()?;
         let mut current_offset = offset;
         let mut advanced = 0;
 
@@ -110,6 +111,287 @@ impl Inode {
         Ok(advanced)
     }
 
+    /// Adds an entry naming `ino`, growing the directory if nothing in it has
+    /// room.
+    pub(in ext4) fn add_entry(&self, name: &str, ino: Ext4Ino, type_: InodeType) -> Result<()> {
+        if name.is_empty() || name.len() > NAME_MAX {
+            return_errno!(Errno::ENAMETOOLONG);
+        }
+        if name.contains('/') {
+            return_errno_with_message!(Errno::EINVAL, "a name may not contain a separator");
+        }
+
+        let fs = self.fs()?;
+        self.check_directory_is_modifiable()?;
+        let needed = DirEntryHeader::min_rec_len(name.len()) as usize;
+        let mut inner = self.inner.write();
+
+        if let Some(slot) = inner.find_slot(needed)? {
+            inner.write_entry(&slot, name, ino, type_)?;
+            inner.set_modified(now());
+            return Ok(());
+        }
+
+        // Nothing had room, so the directory gains a block whose one record
+        // spans it.
+        let size = inner.desc.size as usize;
+        inner.resize(&fs, size + BLOCK_SIZE)?;
+        let slot = DirSlot {
+            offset: size,
+            rec_len: BLOCK_SIZE,
+            shrink_previous_to: None,
+        };
+        inner.write_entry(&slot, name, ino, type_)?;
+        inner.set_modified(now());
+        Ok(())
+    }
+
+    /// Removes the entry naming `name`.
+    pub(in ext4) fn remove_entry(&self, name: &str) -> Result<Ext4Ino> {
+        self.check_directory_is_modifiable()?;
+        let mut inner = self.inner.write();
+        let found = inner.find_entry(name)?;
+        inner.delete_entry(&found)?;
+        inner.set_modified(now());
+        Ok(found.ino)
+    }
+
+    /// Marks this directory as hash-indexed, for a test that needs one.
+    #[cfg(ktest)]
+    pub(in ext4) fn mark_hash_indexed(&self) {
+        self.inner.write().desc.flags |= FileFlags::INDEX_DIR;
+    }
+
+    /// Fails if this directory is one whose entries cannot safely be changed.
+    ///
+    /// A hash-indexed directory keeps an index beside its records, and adding
+    /// or removing a record without maintaining that index makes the names it
+    /// no longer matches unreachable. Reading one is safe, because the index
+    /// hides in records that carry no entry.
+    fn check_directory_is_modifiable(&self) -> Result<()> {
+        if self.inner.read().desc.flags.contains(FileFlags::INDEX_DIR) {
+            return_errno_with_message!(
+                Errno::EOPNOTSUPP,
+                "changing a hash-indexed directory is not implemented"
+            );
+        }
+
+        Ok(())
+    }
+
+    /// Returns whether a directory holds nothing but `.` and `..`.
+    pub(in ext4) fn is_empty_dir(&self) -> Result<bool> {
+        let inner = self.inner.read();
+        let size = inner.desc.size as usize;
+        let page_cache = inner.page_cache_of_data()?;
+
+        for block_idx in 0..size.div_ceil(BLOCK_SIZE) {
+            let block = DirBlockView::new(page_cache, block_idx, size);
+            let mut entries = block.iter_entries();
+            while let Some((_, entry)) = entries.next_entry()? {
+                if entry.header.ino != 0 && entry.name != b"." && entry.name != b".." {
+                    return Ok(false);
+                }
+            }
+        }
+
+        Ok(true)
+    }
+
+    /// Writes the `.` and `..` of a directory that has just been created.
+    pub(in ext4) fn fill_new_dir(&self, parent_ino: Ext4Ino) -> Result<()> {
+        let fs = self.fs()?;
+        let mut inner = self.inner.write();
+        inner.resize(&fs, BLOCK_SIZE)?;
+
+        let page_cache = inner.page_cache_of_data()?;
+        let dot = DirEntryHeader::min_rec_len(1) as usize;
+        write_record(page_cache, 0, dot, ".", self.ino, InodeType::Dir)?;
+        write_record(
+            page_cache,
+            dot,
+            BLOCK_SIZE - dot,
+            "..",
+            parent_ino,
+            InodeType::Dir,
+        )?;
+        Ok(())
+    }
+}
+
+/// Where a new entry will go.
+struct DirSlot {
+    /// Byte offset in the directory at which the new record starts.
+    offset: usize,
+    /// Bytes the new record may occupy.
+    rec_len: usize,
+    /// The record before it, which has to give up the space first.
+    shrink_previous_to: Option<(usize, u16)>,
+}
+
+/// One located entry.
+struct FoundEntry {
+    ino: Ext4Ino,
+    offset: usize,
+    rec_len: usize,
+}
+
+impl InodeInner {
+    /// Finds somewhere in the directory for a record of `needed` bytes.
+    ///
+    /// A record that holds no entry can be taken whole; a live one can give up
+    /// whatever it has beyond what its own name needs.
+    fn find_slot(&self, needed: usize) -> Result<Option<DirSlot>> {
+        let size = self.desc.size as usize;
+        let page_cache = self.page_cache_of_data()?;
+
+        for block_idx in 0..size.div_ceil(BLOCK_SIZE) {
+            let block_offset = block_idx * BLOCK_SIZE;
+            let block = DirBlockView::new(page_cache, block_idx, size);
+            let mut entries = block.iter_entries();
+
+            while let Some((entry_offset, entry)) = entries.next_entry()? {
+                let offset = block_offset + entry_offset;
+                let rec_len = entry.header.rec_len as usize;
+
+                if entry.header.ino == 0 && rec_len >= needed {
+                    return Ok(Some(DirSlot {
+                        offset,
+                        rec_len,
+                        shrink_previous_to: None,
+                    }));
+                }
+
+                let in_use = DirEntryHeader::min_rec_len(entry.header.name_len as usize) as usize;
+                if entry.header.ino != 0 && rec_len >= in_use + needed {
+                    return Ok(Some(DirSlot {
+                        offset: offset + in_use,
+                        rec_len: rec_len - in_use,
+                        shrink_previous_to: Some((offset, in_use as u16)),
+                    }));
+                }
+            }
+        }
+
+        Ok(None)
+    }
+
+    fn write_entry(
+        &self,
+        slot: &DirSlot,
+        name: &str,
+        ino: Ext4Ino,
+        type_: InodeType,
+    ) -> Result<()> {
+        let page_cache = self.page_cache_of_data()?;
+        if let Some((offset, rec_len)) = slot.shrink_previous_to {
+            set_rec_len(page_cache, offset, rec_len)?;
+        }
+        write_record(page_cache, slot.offset, slot.rec_len, name, ino, type_)
+    }
+
+    fn find_entry(&self, name: &str) -> Result<FoundEntry> {
+        let size = self.desc.size as usize;
+        let page_cache = self.page_cache_of_data()?;
+        let wanted = name.as_bytes();
+
+        for block_idx in 0..size.div_ceil(BLOCK_SIZE) {
+            let block_offset = block_idx * BLOCK_SIZE;
+            let block = DirBlockView::new(page_cache, block_idx, size);
+            let mut entries = block.iter_entries();
+            while let Some((entry_offset, entry)) = entries.next_entry()? {
+                if entry.header.ino != 0 && entry.name == wanted {
+                    return Ok(FoundEntry {
+                        ino: entry.header.ino,
+                        offset: block_offset + entry_offset,
+                        rec_len: entry.header.rec_len as usize,
+                    });
+                }
+            }
+        }
+
+        return_errno!(Errno::ENOENT)
+    }
+
+    /// Clears an entry, giving its space to the record before it.
+    fn delete_entry(&self, found: &FoundEntry) -> Result<()> {
+        let page_cache = self.page_cache_of_data()?;
+        let size = self.desc.size as usize;
+        let block_start = (found.offset / BLOCK_SIZE) * BLOCK_SIZE;
+
+        // Walking from the start of the block is the only way to find the
+        // record before this one, because records are not back-linked.
+        let block = DirBlockView::new(page_cache, found.offset / BLOCK_SIZE, size);
+        let mut entries = block.iter_entries();
+        let mut previous = None;
+        while let Some((entry_offset, entry)) = entries.next_entry()? {
+            let offset = block_start + entry_offset;
+            if offset == found.offset {
+                break;
+            }
+            previous = Some((offset, entry.header.rec_len as usize));
+        }
+
+        match previous {
+            Some((offset, rec_len)) => {
+                set_rec_len(page_cache, offset, (rec_len + found.rec_len) as u16)?
+            }
+            // The first record of a block cannot be merged away, so it stays
+            // as a record that holds no entry.
+            None => page_cache.write_val(found.offset, &0u32)?,
+        }
+        if previous.is_some() {
+            page_cache.write_val(found.offset, &0u32)?;
+        }
+        Ok(())
+    }
+}
+
+/// Writes one complete record.
+fn write_record(
+    page_cache: &PageCache,
+    offset: usize,
+    rec_len: usize,
+    name: &str,
+    ino: Ext4Ino,
+    type_: InodeType,
+) -> Result<()> {
+    let header = DirEntryHeader {
+        ino,
+        rec_len: rec_len as u16,
+        name_len: name.len() as u8,
+        file_type: DirEntryFileType::from(type_) as u8,
+    };
+
+    page_cache.write_val(offset, &header)?;
+    page_cache.write_bytes(offset + size_of::<DirEntryHeader>(), name.as_bytes())?;
+    Ok(())
+}
+
+fn set_rec_len(page_cache: &PageCache, offset: usize, rec_len: u16) -> Result<()> {
+    page_cache.write_val(
+        offset + core::mem::offset_of!(DirEntryHeader, rec_len),
+        &rec_len,
+    )?;
+    Ok(())
+}
+
+impl From<InodeType> for DirEntryFileType {
+    fn from(type_: InodeType) -> Self {
+        match type_ {
+            InodeType::File => Self::File,
+            InodeType::Dir => Self::Dir,
+            InodeType::CharDevice => Self::CharDevice,
+            InodeType::BlockDevice => Self::BlockDevice,
+            InodeType::NamedPipe => Self::NamedPipe,
+            InodeType::Socket => Self::Socket,
+            InodeType::SymLink => Self::SymLink,
+            _ => Self::Unknown,
+        }
+    }
+}
+
+impl Inode {
     /// Returns the inode number the given name resolves to.
     fn find_entry(&self, name: &str) -> Result<Ext4Ino> {
         if self.inode_type() != InodeType::Dir {
@@ -119,8 +401,9 @@ impl Inode {
             return_errno!(Errno::ENAMETOOLONG);
         }
 
-        let size = self.file_size();
-        let page_cache = self.page_cache_of_data()?;
+        let inner = self.inner.read();
+        let size = inner.desc.size as usize;
+        let page_cache = inner.page_cache_of_data()?;
         let wanted = name.as_bytes();
 
         for block_idx in 0..size.div_ceil(BLOCK_SIZE) {
@@ -291,7 +574,7 @@ mod test {
     use ostd::prelude::*;
 
     use super::*;
-    use crate::fs::fs_impls::ext4::test_utils::assert_errno;
+    use crate::fs::{file::InodeMode, fs_impls::ext4::test_utils::assert_errno};
 
     #[ktest]
     fn min_rec_len_rounds_up_to_four() {
@@ -345,6 +628,37 @@ mod test {
         assert_eq!(tail_entry.header.ino, 0);
         assert!(tail_entry.name.is_empty());
         assert!(entries.next_entry().expect("should read").is_none());
+    }
+
+    /// A hash-indexed directory reads correctly but must not be changed, since
+    /// nothing here maintains the index beside its records.
+    #[ktest]
+    fn a_hash_indexed_directory_refuses_to_change() {
+        crate::time::clocks::init_for_ktest();
+        let volume = crate::fs::fs_impls::ext4::test_utils::Ext4VolumeBuilder::new().build();
+        let fs = crate::fs::fs_impls::ext4::fs::open(
+            volume.disk.clone(),
+            crate::fs::vfs::file_system::FsFlags::empty(),
+            None,
+        )
+        .expect("should mount");
+        let root = fs
+            .downcast_ref::<crate::fs::fs_impls::ext4::Ext4>()
+            .expect("should be an ext4 volume")
+            .root_inode()
+            .expect("root should be readable");
+
+        let dir = root
+            .create(
+                "hashed",
+                InodeType::Dir,
+                InodeMode::from_bits_truncate(0o755),
+            )
+            .expect("should create");
+        dir.mark_hash_indexed();
+
+        assert_errno(dir.add_entry("name", 2, InodeType::File), Errno::EOPNOTSUPP);
+        assert_errno(dir.remove_entry("."), Errno::EOPNOTSUPP);
     }
 
     #[ktest]

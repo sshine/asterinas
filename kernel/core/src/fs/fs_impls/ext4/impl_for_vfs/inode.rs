@@ -2,12 +2,12 @@
 
 //! VFS inode trait implementations for the ext4 [`Inode`](super::super::Inode).
 //!
-//! Every method that would change the volume reports `EROFS`. The timestamp
-//! setters cannot, because the VFS declares them infallible, so they do
-//! nothing instead; a read-only mount updates no timestamp anyway.
+//! The timestamp setters cannot report that a volume is read-only, because the
+//! VFS declares them infallible, so they do nothing instead.
 
 use core::time::Duration;
 
+use aster_block::bio::BioStatus;
 use device_id::DeviceId;
 
 use crate::{
@@ -18,7 +18,7 @@ use crate::{
         utils::DirentVisitor,
         vfs::{
             file_system::FileSystem,
-            inode::{Extension, FallocMode, FileOps, Inode, Metadata, SymbolicLink},
+            inode::{Extension, FallocMode, FileOps, Inode, Metadata, MknodType, SymbolicLink},
             path::Dentry,
         },
     },
@@ -43,11 +43,13 @@ impl FileOps for Ext4Inode {
 
     fn write_at(
         &self,
-        _offset: usize,
-        _reader: &mut VmReader,
+        offset: usize,
+        reader: &mut VmReader,
         _status_flags: StatusFlags,
     ) -> Result<usize> {
-        return_errno_with_message!(Errno::EROFS, "ext4 writing is not implemented yet")
+        // TODO: `O_DIRECT` is served through the page cache, which is correct
+        // but defeats the point of asking for it.
+        self.write_at(offset, reader)
     }
 
     fn readdir_at(&self, offset: usize, visitor: &mut dyn DirentVisitor) -> Result<usize> {
@@ -60,8 +62,8 @@ impl Inode for Ext4Inode {
         self.file_size()
     }
 
-    fn resize(&self, _self_dentry: &Dentry, _new_size: usize) -> Result<()> {
-        return_errno_with_message!(Errno::EROFS, "ext4 writing is not implemented yet")
+    fn resize(&self, _self_dentry: &Dentry, new_size: usize) -> Result<()> {
+        self.resize(new_size)
     }
 
     fn metadata(&self) -> Result<Metadata> {
@@ -80,43 +82,49 @@ impl Inode for Ext4Inode {
         Ok(self.mode())
     }
 
-    fn set_mode(&self, _self_dentry: &Dentry, _mode: InodeMode) -> Result<()> {
-        return_errno_with_message!(Errno::EROFS, "ext4 writing is not implemented yet")
+    fn set_mode(&self, _self_dentry: &Dentry, mode: InodeMode) -> Result<()> {
+        self.set_mode(mode)
     }
 
     fn owner(&self) -> Result<Uid> {
         Ok(Uid::new(self.uid()))
     }
 
-    fn set_owner(&self, _self_dentry: &Dentry, _uid: Uid) -> Result<()> {
-        return_errno_with_message!(Errno::EROFS, "ext4 writing is not implemented yet")
+    fn set_owner(&self, _self_dentry: &Dentry, uid: Uid) -> Result<()> {
+        self.set_uid(uid.into())
     }
 
     fn group(&self) -> Result<Gid> {
         Ok(Gid::new(self.gid()))
     }
 
-    fn set_group(&self, _self_dentry: &Dentry, _gid: Gid) -> Result<()> {
-        return_errno_with_message!(Errno::EROFS, "ext4 writing is not implemented yet")
+    fn set_group(&self, _self_dentry: &Dentry, gid: Gid) -> Result<()> {
+        self.set_gid(gid.into())
     }
 
     fn atime(&self) -> Duration {
         self.atime()
     }
 
-    fn set_atime(&self, _self_dentry: &Dentry, _time: Duration) {}
+    fn set_atime(&self, _self_dentry: &Dentry, time: Duration) {
+        self.set_atime(time)
+    }
 
     fn mtime(&self) -> Duration {
         self.mtime()
     }
 
-    fn set_mtime(&self, _self_dentry: &Dentry, _time: Duration) {}
+    fn set_mtime(&self, _self_dentry: &Dentry, time: Duration) {
+        self.set_mtime(time)
+    }
 
     fn ctime(&self) -> Duration {
         self.ctime()
     }
 
-    fn set_ctime(&self, _self_dentry: &Dentry, _time: Duration) {}
+    fn set_ctime(&self, _self_dentry: &Dentry, time: Duration) {
+        self.set_ctime(time)
+    }
 
     fn page_cache(&self) -> Option<Arc<Vmo>> {
         self.page_cache()
@@ -160,16 +168,92 @@ impl Inode for Ext4Inode {
         Ok(self.lookup(name)?)
     }
 
+    fn create(
+        &self,
+        _self_dentry: &Dentry,
+        name: &str,
+        type_: InodeType,
+        mode: InodeMode,
+    ) -> Result<Arc<dyn Inode>> {
+        Ok(self.create(name, type_, mode)?)
+    }
+
+    fn create_symlink(
+        &self,
+        _self_dentry: &Dentry,
+        name: &str,
+        target: &str,
+        _mode: InodeMode,
+    ) -> Result<Arc<dyn Inode>> {
+        Ok(self.create_symlink(name, target)?)
+    }
+
+    fn mknod(
+        &self,
+        _self_dentry: &Dentry,
+        name: &str,
+        mode: InodeMode,
+        type_: MknodType,
+    ) -> Result<Arc<dyn Inode>> {
+        let (inode_type, device_id) = match type_ {
+            MknodType::CharDevice(id) => (InodeType::CharDevice, Some(id)),
+            MknodType::BlockDevice(id) => (InodeType::BlockDevice, Some(id)),
+            MknodType::NamedPipe => (InodeType::NamedPipe, None),
+        };
+
+        let new_inode = self.create(name, inode_type, mode)?;
+        if let Some(device_id) = device_id {
+            new_inode.set_device_id(device_id)?;
+        }
+        Ok(new_inode)
+    }
+
+    fn link(&self, _self_dentry: &Dentry, old_dentry: &Dentry, name: &str) -> Result<()> {
+        let old = old_dentry
+            .inode()
+            .downcast_ref::<Ext4Inode>()
+            .ok_or_else(|| Error::with_message(Errno::EXDEV, "the inode is not an ext4 one"))?;
+        self.link(old, name)
+    }
+
+    fn unlink(&self, child_dentry: &Dentry) -> Result<()> {
+        let child = child_dentry
+            .inode()
+            .downcast_ref::<Ext4Inode>()
+            .ok_or_else(|| Error::with_message(Errno::EXDEV, "the inode is not an ext4 one"))?;
+        self.unlink(&child_dentry.name(), child)
+    }
+
+    fn rmdir(&self, child_dentry: &Dentry) -> Result<()> {
+        let child = child_dentry
+            .inode()
+            .downcast_ref::<Ext4Inode>()
+            .ok_or_else(|| Error::with_message(Errno::EXDEV, "the inode is not an ext4 one"))?;
+        self.rmdir(&child_dentry.name(), child)
+    }
+
     fn read_link(&self) -> Result<SymbolicLink> {
         self.read_link().map(SymbolicLink::Plain)
     }
 
-    fn sync(&self, _mode: SyncMode) -> Result<()> {
+    fn sync(&self, mode: SyncMode) -> Result<()> {
+        match mode {
+            SyncMode::Data | SyncMode::Full => self.sync_all()?,
+        }
+        if self.fs()?.block_device().sync()? != BioStatus::Complete {
+            return_errno_with_message!(Errno::EIO, "failed to flush the block device");
+        }
         Ok(())
     }
 
     fn fallocate(&self, _mode: FallocMode, _offset: usize, _len: usize) -> Result<()> {
-        return_errno_with_message!(Errno::EROFS, "ext4 writing is not implemented yet")
+        // A read-only mount is the stronger reason to refuse, and the one a
+        // caller can do something about.
+        self.fs()?.check_writable()?;
+
+        // TODO: Preallocating needs the unwritten extents the reader already
+        // understands, which the writer does not produce yet.
+        return_errno_with_message!(Errno::EOPNOTSUPP, "ext4 fallocate is not implemented yet")
     }
 
     fn fs(&self) -> Arc<dyn FileSystem> {
@@ -213,8 +297,17 @@ mod test {
     /// inode refers back to it weakly, as ext2's does, so the mount is what
     /// keeps it alive.
     fn mount() -> (Arc<dyn FileSystem>, Arc<dyn Inode>) {
+        mount_with(FsFlags::empty())
+    }
+
+    /// Mounts read-only, for the tests about refusing to change the volume.
+    fn mount_read_only() -> (Arc<dyn FileSystem>, Arc<dyn Inode>) {
+        mount_with(FsFlags::RDONLY)
+    }
+
+    fn mount_with(flags: FsFlags) -> (Arc<dyn FileSystem>, Arc<dyn Inode>) {
         let volume = Ext4VolumeBuilder::new().build();
-        let fs = ext4_fs::open(volume.disk.clone(), FsFlags::empty(), None).expect("should mount");
+        let fs = ext4_fs::open(volume.disk.clone(), flags, None).expect("should mount");
         let root = fs.root_inode();
         (fs, root)
     }
@@ -275,7 +368,7 @@ mod test {
 
     #[ktest]
     fn writing_through_the_trait_reports_erofs() {
-        let (_fs, root) = mount();
+        let (_fs, root) = mount_read_only();
         let hello = child(&root, "hello");
         let buf = [0u8; 4];
         let mut reader = VmReader::from(buf.as_slice()).to_fallible();
@@ -289,7 +382,7 @@ mod test {
     /// Every way of changing the volume must refuse, not just the obvious one.
     #[ktest]
     fn changing_a_file_through_the_trait_reports_erofs() {
-        let (_fs, root) = mount();
+        let (_fs, root) = mount_read_only();
         let hello = child(&root, "hello");
         let dentry = root_dentry(hello.clone());
 
@@ -307,7 +400,7 @@ mod test {
     /// can only ignore them. Ignoring them must leave the inode as it was.
     #[ktest]
     fn setting_a_timestamp_on_a_read_only_mount_changes_nothing() {
-        let (_fs, root) = mount();
+        let (_fs, root) = mount_read_only();
         let hello = child(&root, "hello");
         let dentry = root_dentry(hello.clone());
         let before = (hello.atime(), hello.mtime(), hello.ctime());

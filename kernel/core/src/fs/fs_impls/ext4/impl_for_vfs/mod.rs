@@ -9,8 +9,8 @@
 //! * `fs` — `FileSystem` for `Ext4` (sync, stat, root).
 //! * `inode` — `FileOps` and `Inode` for `Inode` (I/O, metadata, lookup).
 //!
-//! Every operation that would change the volume reports `EROFS`, because the
-//! write path is not implemented yet.
+//! An operation that would change a volume mounted read-only reports `EROFS`;
+//! one this driver has not implemented at all reports `EOPNOTSUPP`.
 
 mod fs;
 mod inode;

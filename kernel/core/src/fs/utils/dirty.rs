@@ -26,7 +26,7 @@ impl<T: Debug> Dirty<T> {
     }
 
     /// Creates a new `Dirty` value with the dirty flag set.
-    pub(crate) fn _new_dirty(val: T) -> Dirty<T> {
+    pub(crate) fn new_dirty(val: T) -> Dirty<T> {
         Dirty {
             value: val,
             dirty: true,
